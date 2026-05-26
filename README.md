@@ -51,7 +51,7 @@ Here is how it works:
 ┌─────────────────────────────────────────────────────────────┐
 │                    PGMCP Server                             │
 │                                                             │
-│  🔒 Security    🧠 AI Engine      🌊 Streaming               │
+│  🔒 Security    🧠 AI Engine      🌊 Streaming              │
 │  • Input Valid  • Schema Cache    • Auto-Pagination         │
 │  • Audit Log    • OpenAI API      • Memory Management       │
 │  • SQL Guard    • Error Recovery  • Connection Pool         │
@@ -132,6 +132,12 @@ brew install pgmcp
 # Build from source
 go build -o pgmcp-server ./server
 go build -o pgmcp-client ./client
+```
+
+Add `-ldflags="-s -w -extldflags=-static" -trimpath` if you want to get stripped executables (no debug info):
+```console
+go build -ldflags="-s -w -extldflags=-static" -trimpath -o pgmcp-server ./server
+go build -ldflags="-s -w -extldflags=-static" -trimpath -o pgmcp-client ./client
 ```
 
 ### Docker/Kubernetes
