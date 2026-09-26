@@ -2,7 +2,30 @@
 
 MCP-сервер і CLI для прямих запитів до PostgreSQL та перегляду схеми. SQL передає MCP-клієнт; сервер не викликає LLM і не надсилає схему бази зовнішньому сервісу.
 
-## Збірка
+## Встановлення
+
+Потрібен Go 1.27 або новіший.
+
+```sh
+go install github.com/h0rn3t/postgres-mcp/server@latest
+go install github.com/h0rn3t/postgres-mcp/client@latest
+```
+
+Програми встановлює саме `go install`: починаючи з Go 1.17, `go get` лише додає залежність у `go.mod` поточного модуля й бінарників не збирає.
+
+`go install` кладе бінарники в `$GOBIN`, а якщо його не задано — у `$(go env GOPATH)/bin` (зазвичай `~/go/bin`), і називає їх за іменем пакета: `server` і `client`. Щоб імена збігалися з прикладами нижче, перейменуйте їх:
+
+```sh
+BIN="$(go env GOBIN)"; BIN="${BIN:-$(go env GOPATH)/bin}"
+mv "$BIN/server" "$BIN/postgres-mcp-server"
+mv "$BIN/client" "$BIN/postgres-mcp-client"
+```
+
+Цей каталог має бути в `PATH`; у конфігураціях MCP-клієнтів нижче вказуйте повний шлях, наприклад `/Users/you/go/bin/postgres-mcp-server`.
+
+Релізних тегів поки немає, тож `@latest` бере останній коміт гілки за замовчуванням. Конкретну версію можна зафіксувати хешем коміту: `go install github.com/h0rn3t/postgres-mcp/server@<commit>`. Бінарник, встановлений через `go install`, на `--version` показує `dev`: версію вписує лише збірка релізу.
+
+### Збірка з вихідного коду
 
 ```sh
 go build -o postgres-mcp-server ./server
