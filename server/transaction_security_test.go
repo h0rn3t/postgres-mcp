@@ -11,7 +11,7 @@ import (
 
 func TestTransactionEscapeAttempts(t *testing.T) {
 	// Test attempts to escape read-only transaction scope
-	// Addresses GitHub issue: https://github.com/subnetmarco/pgmcp/issues/7
+	// Addresses GitHub issue: https://github.com/h0rn3t/postgres-mcp/issues/7
 
 	escapeAttempts := []struct {
 		name        string

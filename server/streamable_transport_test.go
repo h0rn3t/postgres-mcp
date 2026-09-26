@@ -34,7 +34,7 @@ func TestStreamableHTTPTransport(t *testing.T) {
 	}
 
 	// Create MCP server with streamable HTTP handler
-	impl := &mcp.Implementation{Name: "pgmcp-test", Version: "0.1.0"}
+	impl := &mcp.Implementation{Name: "postgres-mcp-test", Version: "0.1.0"}
 	server := mcp.NewServer(impl, nil)
 
 	mcp.AddTool(server, &mcp.Tool{

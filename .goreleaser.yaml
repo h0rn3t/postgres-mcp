@@ -1,6 +1,6 @@
 version: 2
 
-project_name: pgmcp
+project_name: postgres-mcp
 
 before:
   hooks:
@@ -8,9 +8,9 @@ before:
     - go generate ./...
 
 builds:
-  - id: pgmcp-server
+  - id: postgres-mcp-server
     main: ./server
-    binary: pgmcp-server
+    binary: postgres-mcp-server
     goos:
       - linux
       - darwin
@@ -28,9 +28,9 @@ builds:
       - -X main.commit={{.Commit}}
       - -X main.date={{.Date}}
 
-  - id: pgmcp-client
+  - id: postgres-mcp-client
     main: ./client
-    binary: pgmcp-client
+    binary: postgres-mcp-client
     goos:
       - linux
       - darwin
@@ -49,8 +49,8 @@ builds:
       - -X main.date={{.Date}}
 
 archives:
-  - id: pgmcp
-    name_template: "pgmcp_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
+  - id: postgres-mcp
+    name_template: "postgres-mcp_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
     files:
       - README.md
       - LICENSE
@@ -92,7 +92,7 @@ release:
   prerelease: auto
   mode: replace
   header: |
-    ## PGMCP {{ .Tag }}
+    ## postgres-mcp {{ .Tag }}
     
     PostgreSQL Model Context Protocol Server - Pre-compiled binaries for multiple platforms.
     
@@ -105,8 +105,8 @@ release:
        export DATABASE_URL="postgres://user:password@localhost:5432/mydb"
        export OPENAI_API_KEY="your-api-key"  # Optional
        ```
-    4. Run the server: `./pgmcp-server`
-    5. Test with the client: `./pgmcp-client -ask "What tables do I have?" -format table`
+    4. Run the server: `./postgres-mcp-server`
+    5. Test with the client: `./postgres-mcp-client -ask "What tables do I have?" -format table`
     
     ### Platform Support
     
@@ -119,60 +119,60 @@ release:
     
     ```bash
     # Homebrew (macOS/Linux)
-    brew tap subnetmarco/homebrew-tap
-    brew install pgmcp
+    brew tap h0rn3t/homebrew-tap
+    brew install postgres-mcp
     
     # Linux packages
-    sudo apt install ./pgmcp_{{ .Version }}_linux_amd64.deb  # Debian/Ubuntu
-    sudo rpm -i pgmcp_{{ .Version }}_linux_amd64.rpm         # RedHat/CentOS
+    sudo apt install ./postgres-mcp_{{ .Version }}_linux_amd64.deb  # Debian/Ubuntu
+    sudo rpm -i postgres-mcp_{{ .Version }}_linux_amd64.rpm         # RedHat/CentOS
     ```
     
     ### Docker
     
     ```bash
     # Server
-    docker run -e DATABASE_URL=your_db_url -e OPENAI_API_KEY=your_key ghcr.io/subnetmarco/pgmcp:{{ .Tag }}
+    docker run -e DATABASE_URL=your_db_url -e OPENAI_API_KEY=your_key ghcr.io/h0rn3t/postgres-mcp:{{ .Tag }}
     ```
     
-    **Full Changelog**: https://github.com/subnetmarco/pgmcp/compare/{{ .PreviousTag }}...{{ .Tag }}
+    **Full Changelog**: https://github.com/h0rn3t/postgres-mcp/compare/{{ .PreviousTag }}...{{ .Tag }}
 
 brews:
-  - name: pgmcp
+  - name: postgres-mcp
     description: "PostgreSQL Model Context Protocol Server"
-    homepage: "https://github.com/subnetmarco/pgmcp"
+    homepage: "https://github.com/h0rn3t/postgres-mcp"
     license: "Apache-2.0"
     repository:
-      owner: subnetmarco
+      owner: h0rn3t
       name: homebrew-tap
       token: "{{ .Env.HOMEBREW_TAP_GITHUB_TOKEN }}"
     install: |
-      bin.install "pgmcp-server"
-      bin.install "pgmcp-client"
+      bin.install "postgres-mcp-server"
+      bin.install "postgres-mcp-client"
     test: |
-      system "#{bin}/pgmcp-server", "--version"
+      system "#{bin}/postgres-mcp-server", "--version"
 
 dockers:
   - image_templates:
-      - "ghcr.io/subnetmarco/pgmcp:{{ .Tag }}"
-      - "ghcr.io/subnetmarco/pgmcp:latest"
+      - "ghcr.io/h0rn3t/postgres-mcp:{{ .Tag }}"
+      - "ghcr.io/h0rn3t/postgres-mcp:latest"
     dockerfile: Dockerfile
     build_flag_templates:
       - "--platform=linux/amd64"
       - "--label=org.opencontainers.image.title={{ .ProjectName }}"
       - "--label=org.opencontainers.image.description=PostgreSQL Model Context Protocol Server"
-      - "--label=org.opencontainers.image.url=https://github.com/subnetmarco/pgmcp"
-      - "--label=org.opencontainers.image.source=https://github.com/subnetmarco/pgmcp"
+      - "--label=org.opencontainers.image.url=https://github.com/h0rn3t/postgres-mcp"
+      - "--label=org.opencontainers.image.source=https://github.com/h0rn3t/postgres-mcp"
       - "--label=org.opencontainers.image.version={{ .Version }}"
       - "--label=org.opencontainers.image.created={{ .Date }}"
       - "--label=org.opencontainers.image.revision={{ .FullCommit }}"
       - "--label=org.opencontainers.image.licenses=Apache-2.0"
 
 nfpms:
-  - id: pgmcp
-    package_name: pgmcp
-    vendor: SubnetMarco
-    homepage: https://github.com/subnetmarco/pgmcp
-    maintainer: Marco Palladino <marco@subnetmarco.com>
+  - id: postgres-mcp
+    package_name: postgres-mcp
+    vendor: h0rn3t
+    homepage: https://github.com/h0rn3t/postgres-mcp
+    maintainer: h0rn3t
     description: PostgreSQL Model Context Protocol Server
     license: Apache-2.0
     formats:
@@ -182,6 +182,6 @@ nfpms:
     bindir: /usr/bin
     contents:
       - src: ./README.md
-        dst: /usr/share/doc/pgmcp/README.md
+        dst: /usr/share/doc/postgres-mcp/README.md
       - src: ./LICENSE
-        dst: /usr/share/doc/pgmcp/LICENSE
+        dst: /usr/share/doc/postgres-mcp/LICENSE

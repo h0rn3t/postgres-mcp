@@ -1,34 +1,34 @@
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: pgmcp-server
+  name: postgres-mcp-server
   labels:
-    app: pgmcp-server
+    app: postgres-mcp-server
 spec:
   replicas: 1
   selector:
     matchLabels:
-      app: pgmcp-server
+      app: postgres-mcp-server
   template:
     metadata:
       labels:
-        app: pgmcp-server
+        app: postgres-mcp-server
     spec:
       containers:
-      - name: pgmcp-server
-        image: ghcr.io/subnetmarco/pgmcp:latest
+      - name: postgres-mcp-server
+        image: ghcr.io/h0rn3t/postgres-mcp:latest
         ports:
         - containerPort: 8080
         env:
         - name: DATABASE_URL
           valueFrom:
             secretKeyRef:
-              name: pgmcp-secret
+              name: postgres-mcp-secret
               key: database-url
         - name: OPENAI_API_KEY
           valueFrom:
             secretKeyRef:
-              name: pgmcp-secret
+              name: postgres-mcp-secret
               key: openai-api-key
               optional: true
         resources:
@@ -54,31 +54,31 @@ spec:
 apiVersion: v1
 kind: Service
 metadata:
-  name: pgmcp-service
+  name: postgres-mcp-service
   labels:
-    app: pgmcp-server
+    app: postgres-mcp-server
 spec:
   ports:
   - port: 8080
     targetPort: 8080
   selector:
-    app: pgmcp-server
+    app: postgres-mcp-server
 ---
 apiVersion: networking.k8s.io/v1
 kind: Ingress
 metadata:
-  name: pgmcp-ingress
+  name: postgres-mcp-ingress
   annotations:
     nginx.ingress.kubernetes.io/rewrite-target: /
 spec:
   rules:
-  - host: pgmcp.yourdomain.com
+  - host: postgres-mcp.yourdomain.com
     http:
       paths:
       - path: /
         pathType: Prefix
         backend:
           service:
-            name: pgmcp-service
+            name: postgres-mcp-service
             port:
               number: 8080

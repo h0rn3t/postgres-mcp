@@ -1,33 +1,33 @@
-# Kubernetes Deployment
+# Розгортання в Kubernetes
 
-## Quick Deploy
+## Швидке розгортання
 
 ```bash
-# Create secret with your database URL
-kubectl create secret generic pgmcp-secret \
+# Створення секрету з URL вашої бази даних
+kubectl create secret generic postgres-mcp-secret \
   --from-literal=database-url="postgres://user:pass@your-db-host:5432/your-db" \
   --from-literal=openai-api-key="your-openai-key"
 
-# Deploy PGMCP
+# Розгортання postgres-mcp
 kubectl apply -f deployment.yaml
 
-# Check status
-kubectl get pods -l app=pgmcp-server
+# Перевірка статусу
+kubectl get pods -l app=postgres-mcp-server
 
-# Test (port forward)
-kubectl port-forward service/pgmcp-service 8080:8080
+# Тестування (проброс портів)
+kubectl port-forward service/postgres-mcp-service 8080:8080
 curl http://localhost:8080/healthz
 ```
 
-## Configuration
+## Конфігурація
 
-- Update `pgmcp.yourdomain.com` in the Ingress to your actual domain
-- Modify resource limits based on your needs
-- Add SSL/TLS configuration if needed
+- Оновіть `postgres-mcp.yourdomain.com` в Ingress на ваш реальний домен
+- Змініть ліміти ресурсів відповідно до ваших потреб
+- За потреби додайте конфігурацію SSL/TLS
 
-## Production Notes
+## Нотатки для продакшену
 
-- Use proper secrets management (not literal values)
-- Configure monitoring and logging
-- Set up proper ingress with SSL certificates
-- Consider using HorizontalPodAutoscaler for scaling
+- Використовуйте належне керування секретами (не літеральні значення)
+- Налаштуйте моніторинг і логування
+- Налаштуйте належний ingress із SSL-сертифікатами
+- Розгляньте використання HorizontalPodAutoscaler для масштабування

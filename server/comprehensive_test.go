@@ -679,7 +679,7 @@ func mustPoolForBench(b *testing.B) *pgxpool.Pool {
 	b.Helper()
 	dsn := os.Getenv("DATABASE_URL")
 	if dsn == "" {
-		dsn = "postgres://postgres:postgres@127.0.0.1:5432/pgmcp_test?sslmode=disable"
+		dsn = "postgres://postgres:postgres@127.0.0.1:5432/postgres_mcp_test?sslmode=disable"
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()

@@ -19,8 +19,8 @@ go.work
 go.work.sum
 
 # Built binaries
-pgmcp-server
-pgmcp-client
+postgres-mcp-server
+postgres-mcp-client
 
 # Build directory
 build/

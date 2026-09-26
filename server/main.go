@@ -7,6 +7,7 @@ import (
 	"flag"
 	"fmt"
 	"net/http"
+	"net/url"
 	"os"
 	"os/signal"
 	"regexp"
@@ -67,7 +68,7 @@ func (c *Config) Validate() error {
 	var errs []string
 
 	if c.DatabaseURL == "" {
-		errs = append(errs, "DATABASE_URL is required")
+		errs = append(errs, "DATABASE_URL is required (or POSTGRES_HOST/POSTGRES_PORT/POSTGRES_DATABASE/POSTGRES_USER/POSTGRES_PASSWORD)")
 	}
 
 	if c.MaxRows <= 0 {
@@ -243,8 +244,10 @@ func mustConfig() Config {
 		}
 	}
 
+	databaseURL := resolveDatabaseURL()
+
 	cfg := Config{
-		DatabaseURL: envOrDie("DATABASE_URL"),
+		DatabaseURL: databaseURL,
 		OpenAIKey:   os.Getenv("OPENAI_API_KEY"),
 		OpenAIModel: envDefault("OPENAI_MODEL", "gpt-4o-mini"),
 		OpenAIBase:  os.Getenv("OPENAI_BASE_URL"),
@@ -278,6 +281,63 @@ func envDefault(k, def string) string {
 		return v
 	}
 	return def
+}
+
+func firstNonEmpty(vals ...string) string {
+	for _, v := range vals {
+		if strings.TrimSpace(v) != "" {
+			return strings.TrimSpace(v)
+		}
+	}
+	return ""
+}
+
+// resolveDatabaseURL returns DATABASE_URL if set, otherwise builds it from
+// separate POSTGRES_* variables (mssql-mcp style config).
+// Supported variables (POSTGRES_* take precedence, PG* are fallbacks):
+//
+//	POSTGRES_HOST / PGHOST (required if DATABASE_URL is not set)
+//	POSTGRES_PORT / PGPORT (default "5432")
+//	POSTGRES_DATABASE / POSTGRES_DB / PGDATABASE (required)
+//	POSTGRES_USER / POSTGRES_USERNAME / PGUSER (required)
+//	POSTGRES_PASSWORD / PGPASSWORD (may be empty for trust auth)
+//	POSTGRES_SSLMODE / PGSSLMODE (default "disable")
+func resolveDatabaseURL() string {
+	if v := strings.TrimSpace(os.Getenv("DATABASE_URL")); v != "" {
+		return v
+	}
+	if v := strings.TrimSpace(os.Getenv("POSTGRES_URL")); v != "" {
+		return v
+	}
+
+	host := firstNonEmpty(os.Getenv("POSTGRES_HOST"), os.Getenv("PGHOST"))
+	port := firstNonEmpty(os.Getenv("POSTGRES_PORT"), os.Getenv("PGPORT"), "5432")
+	database := firstNonEmpty(os.Getenv("POSTGRES_DATABASE"), os.Getenv("POSTGRES_DB"), os.Getenv("PGDATABASE"))
+	user := firstNonEmpty(os.Getenv("POSTGRES_USER"), os.Getenv("POSTGRES_USERNAME"), os.Getenv("PGUSER"))
+	password := firstNonEmpty(os.Getenv("POSTGRES_PASSWORD"), os.Getenv("PGPASSWORD"))
+	sslmode := firstNonEmpty(os.Getenv("POSTGRES_SSLMODE"), os.Getenv("PGSSLMODE"), "disable")
+
+	if host == "" && database == "" && user == "" {
+		log.Fatal().Msg("missing required env DATABASE_URL (or POSTGRES_HOST/POSTGRES_PORT/POSTGRES_DATABASE/POSTGRES_USER/POSTGRES_PASSWORD)")
+	}
+	if host == "" || database == "" || user == "" {
+		log.Fatal().Msgf("incomplete postgres config: POSTGRES_HOST=%q POSTGRES_DATABASE=%q POSTGRES_USER=%q (password may be empty); or set DATABASE_URL", host, database, user)
+	}
+
+	u := &url.URL{
+		Scheme: "postgres",
+		Host:   host + ":" + port,
+		Path:   "/" + database,
+	}
+	if password != "" {
+		u.User = url.UserPassword(user, password)
+	} else {
+		u.User = url.User(user)
+	}
+	q := u.Query()
+	q.Set("sslmode", sslmode)
+	u.RawQuery = q.Encode()
+	return u.String()
 }
 
 func newServer(ctx context.Context, cfg Config) (*Server, error) {
@@ -1132,17 +1192,32 @@ Return ONLY SQL, nothing else.`
 }
 
 func main() {
-	// Handle version flag
+	// Handle version flag and transport selection.
+	// stdio transport allows mssql-mcp style config:
+	//   {"mcpServers": {"postgres": {"command": "/path/to/postgres-mcp-server", "env": {...}}}}
 	versionFlag := flag.Bool("version", false, "Print version information and exit")
+	transportFlag := flag.String("transport", "", "MCP transport: stdio or http (overrides MCP_TRANSPORT env, default http)")
 	flag.Parse()
 
 	if *versionFlag {
-		fmt.Printf("pgmcp-server %s\n", version)
+		fmt.Printf("postgres-mcp-server %s\n", version)
 		fmt.Printf("  commit: %s\n", commit)
 		fmt.Printf("  built:  %s\n", date)
 		os.Exit(0)
 	}
 
+	transport := strings.ToLower(strings.TrimSpace(firstNonEmpty(*transportFlag, os.Getenv("MCP_TRANSPORT"), "http")))
+	if transport == "stdin" || transport == "standard" || transport == "standard-io" {
+		transport = "stdio"
+	}
+	if transport != "stdio" && transport != "http" && transport != "streamable" && transport != "streamable-http" {
+		fmt.Fprintf(os.Stderr, "unknown transport %q: must be stdio or http\n", transport)
+		os.Exit(1)
+	}
+	isStdio := transport == "stdio"
+
+	// In stdio mode stdout is reserved for the MCP protocol — force all logs to stderr.
+	log.Logger = log.Output(os.Stderr)
 	zerolog.TimeFieldFormat = time.RFC3339
 	switch strings.ToLower(envDefault("LOG_LEVEL", "info")) {
 	case "debug":
@@ -1162,7 +1237,7 @@ func main() {
 	if err != nil {
 		log.Fatal().Err(err).Msg("init failed")
 	}
-	impl := &mcp.Implementation{Name: "pgmcp-go", Version: "0.3.0"}
+	impl := &mcp.Implementation{Name: "postgres-mcp-go", Version: "0.3.0"}
 
 	server := mcp.NewServer(impl, nil)
 
@@ -1178,6 +1253,11 @@ func main() {
 		Name:        "stream",
 		Description: "Stream large result sets by automatically fetching all pages. Returns complete results progressively.",
 	}, srv.handleStream)
+
+	if isStdio {
+		runStdio(ctx, srv, server)
+		return
+	}
 
 	// --- Streamable HTTP transport ---
 	addr := envDefault("HTTP_ADDR", ":8080")
@@ -1242,5 +1322,21 @@ func main() {
 
 	if err := httpServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 		log.Fatal().Err(err).Msg("server error")
+	}
+}
+
+// runStdio serves MCP over stdin/stdout (mssql-mcp style: {"command": ".../postgres-mcp-server", "env": {...}}).
+// stdout is reserved for the protocol — all logs must go to stderr (configured in main).
+func runStdio(ctx context.Context, srv *Server, server *mcp.Server) {
+	defer srv.db.Close()
+
+	ctx, stop := signal.NotifyContext(ctx, syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+
+	log.Info().Msg("starting MCP server on stdio")
+	auditLog("server_start", "system", "", "stdio", true)
+
+	if err := server.Run(ctx, &mcp.StdioTransport{}); err != nil {
+		log.Fatal().Err(err).Msg("stdio server error")
 	}
 }

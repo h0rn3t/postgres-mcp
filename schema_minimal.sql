@@ -1,4 +1,4 @@
--- Minimal Test Schema for PGMCP
+-- Minimal Test Schema for postgres-mcp
 -- Includes mixed-case table names to test case sensitivity
 -- Reduced data for faster CI execution
 

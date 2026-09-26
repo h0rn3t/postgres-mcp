@@ -1,6 +1,6 @@
 # Release Process
 
-This document describes how to create releases for PGMCP.
+This document describes how to create releases for postgres-mcp.
 
 ## Automated Releases (GitHub Actions)
 
@@ -24,7 +24,7 @@ The project uses GitHub Actions and GoReleaser for automated releases.
    ```
 
 3. **Monitor the workflow**:
-   - Go to [GitHub Actions](https://github.com/subnetmarco/pgmcp/actions)
+   - Go to [GitHub Actions](https://github.com/h0rn3t/postgres-mcp/actions)
    - Watch the "release" workflow complete
    - The workflow will:
      - Build binaries for all platforms
@@ -40,7 +40,7 @@ The release workflow builds:
 
 - **Platforms**: Linux, macOS, Windows
 - **Architectures**: amd64, arm64
-- **Binaries**: `pgmcp-server` and `pgmcp-client`
+- **Binaries**: `postgres-mcp-server` and `postgres-mcp-client`
 - **Archives**: Platform-specific archives with binaries + documentation
 - **Docker**: Multi-platform Docker images
 - **Packages**: Debian/RPM packages (future)
@@ -48,7 +48,7 @@ The release workflow builds:
 
 ### Assets Included in Each Release
 
-- `pgmcp-server` and `pgmcp-client` binaries
+- `postgres-mcp-server` and `postgres-mcp-client` binaries
 - `README.md` - Project documentation
 - `LICENSE` - License file
 - `schema.sql` - Full database schema
@@ -81,7 +81,7 @@ ls build/release/
 ```bash
 # After running the release script
 gh release create v1.0.0 build/release/* \
-  --title "PGMCP v1.0.0" \
+  --title "postgres-mcp v1.0.0" \
   --notes "Release notes here"
 ```
 
@@ -115,7 +115,7 @@ Examples:
 
 ### Release Workflow Fails
 
-1. Check [GitHub Actions logs](https://github.com/subnetmarco/pgmcp/actions)
+1. Check [GitHub Actions logs](https://github.com/h0rn3t/postgres-mcp/actions)
 2. Common issues:
    - Build failures (check Go version compatibility)
    - GoReleaser configuration errors
@@ -152,15 +152,15 @@ goreleaser build --clean --snapshot
 ## Docker Images
 
 Docker images are automatically built and pushed to:
-- `ghcr.io/subnetmarco/pgmcp:latest`
-- `ghcr.io/subnetmarco/pgmcp:v1.0.0`
+- `ghcr.io/h0rn3t/postgres-mcp:latest`
+- `ghcr.io/h0rn3t/postgres-mcp:v1.0.0`
 
 ### Manual Docker Build
 
 ```bash
 # Build locally
-docker build -t pgmcp:local .
+docker build -t postgres-mcp:local .
 
 # Test
-docker run -e DATABASE_URL="..." -e OPENAI_API_KEY="..." -p 8080:8080 pgmcp:local
+docker run -e DATABASE_URL="..." -e OPENAI_API_KEY="..." -p 8080:8080 postgres-mcp:local
 ```

@@ -1,6 +1,6 @@
 #!/bin/bash
 
-# PGMCP Release Script
+# postgres-mcp Release Script
 # Builds binaries for multiple platforms and creates release archives
 
 set -e
@@ -15,7 +15,7 @@ if [ "$VERSION" = "dev" ]; then
     exit 1
 fi
 
-echo "Building PGMCP $VERSION"
+echo "Building postgres-mcp $VERSION"
 echo "Commit: $COMMIT"
 echo "Date: $DATE"
 
@@ -50,11 +50,11 @@ for platform in "${PLATFORMS[@]}"; do
     mkdir -p "$platform_dir"
     
     # Set binary names (add .exe for Windows)
-    server_binary="pgmcp-server"
-    client_binary="pgmcp-client"
+    server_binary="postgres-mcp-server"
+    client_binary="postgres-mcp-client"
     if [ "$goos" = "windows" ]; then
-        server_binary="pgmcp-server.exe"
-        client_binary="pgmcp-client.exe"
+        server_binary="postgres-mcp-server.exe"
+        client_binary="postgres-mcp-client.exe"
     fi
     
     # Build server
@@ -78,7 +78,7 @@ for platform in "${PLATFORMS[@]}"; do
     cp schema_minimal.sql "$platform_dir/"
     
     # Create archive
-    archive_name="pgmcp_${VERSION}_${goos}_${goarch}"
+    archive_name="postgres-mcp_${VERSION}_${goos}_${goarch}"
     if [ "$goos" = "windows" ]; then
         cd "$BUILD_DIR" && zip -r "$RELEASE_DIR/$archive_name.zip" "${goos}-${goarch}/" && cd ..
     else
@@ -109,4 +109,4 @@ echo "1. Create and push a git tag: git tag $VERSION && git push origin $VERSION
 echo "2. The GitHub Actions workflow will automatically create the release"
 echo ""
 echo "Or upload manually:"
-echo "gh release create $VERSION $RELEASE_DIR/* --title \"PGMCP $VERSION\" --notes \"Release $VERSION\""
+echo "gh release create $VERSION $RELEASE_DIR/* --title \"postgres-mcp $VERSION\" --notes \"Release $VERSION\""

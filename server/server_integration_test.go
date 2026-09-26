@@ -20,7 +20,7 @@ func mustPool(t *testing.T) *pgxpool.Pool {
 	dsn := os.Getenv("DATABASE_URL")
 	if dsn == "" {
 		// CI default (matches workflow below)
-		dsn = "postgres://postgres:postgres@127.0.0.1:5432/pgmcp_test?sslmode=disable"
+		dsn = "postgres://postgres:postgres@127.0.0.1:5432/postgres_mcp_test?sslmode=disable"
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
@@ -45,7 +45,7 @@ func resetSchema(t *testing.T, db *pgxpool.Pool) {
 
 	// Load the same minimal schema that CI uses
 	minimalSchema := `
--- Minimal Test Schema for PGMCP
+-- Minimal Test Schema for postgres-mcp
 -- Includes mixed-case table names to test case sensitivity
 
 -- Categories table with mixed-case name (tests case sensitivity)

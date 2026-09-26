@@ -1,0 +1,12 @@
+{
+  "lastQuery": null,
+  "perAgentQuery": {},
+  "graftReads": 0,
+  "sourceReads": 0,
+  "savedTokens": 0,
+  "injectedPointers": [],
+  "transcriptOffsets": {
+    "/Users/eugeneshershen/Library/Application Support/Code/User/workspaceStorage/ebe2a8b3cba00adb26fc45ad9e9c91f5/GitHub.copilot-chat/transcripts/01fef369-1c75-4e20-90c4-b9feedf8df9f.jsonl": 333321
+  },
+  "nudges": 0
+}

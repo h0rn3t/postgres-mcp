@@ -32,8 +32,8 @@ func (a *asksFlag) String() string     { return strings.Join(*a, "; ") }
 func (a *asksFlag) Set(v string) error { *a = append(*a, v); return nil }
 
 func main() {
-	url := getenv("PGMCP_SERVER_URL", "http://127.0.0.1:8080/mcp")
-	bearer := os.Getenv("PGMCP_AUTH_BEARER")
+	url := getenv("POSTGRES_MCP_SERVER_URL", "http://127.0.0.1:8080/mcp")
+	bearer := os.Getenv("POSTGRES_MCP_AUTH_BEARER")
 
 	serverURL := flag.String("url", url, "MCP server URL (e.g. http://host:8080/mcp)")
 	auth := flag.String("bearer", bearer, "Optional bearer token")
@@ -47,7 +47,7 @@ func main() {
 	flag.Parse()
 
 	if *versionFlag {
-		fmt.Printf("pgmcp-client %s\n", version)
+		fmt.Printf("postgres-mcp-client %s\n", version)
 		fmt.Printf("  commit: %s\n", commit)
 		fmt.Printf("  built:  %s\n", date)
 		os.Exit(0)
@@ -67,7 +67,7 @@ func main() {
 		HTTPClient: httpClient,
 	}
 
-	client := mcp.NewClient(&mcp.Implementation{Name: "pgmcp-client", Version: "0.5.0"}, nil)
+	client := mcp.NewClient(&mcp.Implementation{Name: "postgres-mcp-client", Version: "0.5.0"}, nil)
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
 

@@ -1,4 +1,4 @@
-module github.com/you/pgmcp
+module github.com/h0rn3t/postgres-mcp
 
 go 1.26.1
 

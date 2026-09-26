@@ -9,35 +9,35 @@ echo "Testing build for multiple platforms..."
 
 # Test builds for main platforms
 echo "Building for Linux amd64..."
-GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /tmp/pgmcp-server-linux-amd64 ./server
-GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /tmp/pgmcp-client-linux-amd64 ./client
+GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /tmp/postgres-mcp-server-linux-amd64 ./server
+GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /tmp/postgres-mcp-client-linux-amd64 ./client
 
 echo "Building for macOS amd64..."
-GOOS=darwin GOARCH=amd64 CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /tmp/pgmcp-server-darwin-amd64 ./server
-GOOS=darwin GOARCH=amd64 CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /tmp/pgmcp-client-darwin-amd64 ./client
+GOOS=darwin GOARCH=amd64 CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /tmp/postgres-mcp-server-darwin-amd64 ./server
+GOOS=darwin GOARCH=amd64 CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /tmp/postgres-mcp-client-darwin-amd64 ./client
 
 echo "Building for macOS arm64..."
-GOOS=darwin GOARCH=arm64 CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /tmp/pgmcp-server-darwin-arm64 ./server
-GOOS=darwin GOARCH=arm64 CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /tmp/pgmcp-client-darwin-arm64 ./client
+GOOS=darwin GOARCH=arm64 CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /tmp/postgres-mcp-server-darwin-arm64 ./server
+GOOS=darwin GOARCH=arm64 CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /tmp/postgres-mcp-client-darwin-arm64 ./client
 
 echo "Building for Windows amd64..."
-GOOS=windows GOARCH=amd64 CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /tmp/pgmcp-server-windows-amd64.exe ./server
-GOOS=windows GOARCH=amd64 CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /tmp/pgmcp-client-windows-amd64.exe ./client
+GOOS=windows GOARCH=amd64 CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /tmp/postgres-mcp-server-windows-amd64.exe ./server
+GOOS=windows GOARCH=amd64 CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /tmp/postgres-mcp-client-windows-amd64.exe ./client
 
 echo "All builds successful!"
 
 # Test version flags (local build)
 echo "Testing version flags..."
-go build -o /tmp/pgmcp-server-test ./server
-go build -o /tmp/pgmcp-client-test ./client
+go build -o /tmp/postgres-mcp-server-test ./server
+go build -o /tmp/postgres-mcp-client-test ./client
 
 echo "Server version:"
-/tmp/pgmcp-server-test -version
+/tmp/postgres-mcp-server-test -version
 
 echo "Client version:"
-/tmp/pgmcp-client-test -version
+/tmp/postgres-mcp-client-test -version
 
 # Clean up
-rm -f /tmp/pgmcp-*
+rm -f /tmp/postgres-mcp-*
 
 echo "All tests passed!"
