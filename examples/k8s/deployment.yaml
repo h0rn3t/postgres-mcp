@@ -25,12 +25,6 @@ spec:
             secretKeyRef:
               name: postgres-mcp-secret
               key: database-url
-        - name: OPENAI_API_KEY
-          valueFrom:
-            secretKeyRef:
-              name: postgres-mcp-secret
-              key: openai-api-key
-              optional: true
         resources:
           requests:
             memory: "256Mi"

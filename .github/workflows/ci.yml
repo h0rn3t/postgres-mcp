@@ -27,7 +27,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
         with:
-          go-version: "1.23"
+          go-version-file: go.mod
       - name: Install PostgreSQL Client
         run: |
           sudo apt-get update
@@ -58,14 +58,14 @@ jobs:
         run: go test ./server -tags=integration -v
       - name: End-to-End Test (Search Only)
         run: |
-          # Start server in background (no OpenAI key needed for search)
+          # Start server in background for search checks
           ./postgres-mcp-server &
           SERVER_PID=$!
           
           # Wait for server to start
           sleep 5
           
-          # Test search functionality (doesn't require OpenAI)
+          # Test search functionality
           echo "Testing search functionality..."
           ./postgres-mcp-client -search "Electronics" -format table
           ./postgres-mcp-client -search "good" -format json

@@ -162,5 +162,5 @@ Docker images are automatically built and pushed to:
 docker build -t postgres-mcp:local .
 
 # Test
-docker run -e DATABASE_URL="..." -e OPENAI_API_KEY="..." -p 8080:8080 postgres-mcp:local
+docker run -e DATABASE_URL="..." -p 8080:8080 postgres-mcp:local
 ```

@@ -1,539 +1,240 @@
-[![ci](https://github.com/h0rn3t/postgres-mcp/actions/workflows/ci.yml/badge.svg)](https://github.com/h0rn3t/postgres-mcp/actions/workflows/ci.yml)
-[![Go Report Card](https://goreportcard.com/badge/github.com/h0rn3t/postgres-mcp)](https://goreportcard.com/report/github.com/h0rn3t/postgres-mcp)
-[![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](https://opensource.org/licenses/Apache-2.0)
+# postgres-mcp
 
-# postgres-mcp — сервер PostgreSQL Model Context Protocol
+MCP-сервер і CLI для прямих запитів до PostgreSQL та перегляду схеми. SQL передає MCP-клієнт; сервер не викликає LLM і не надсилає схему бази зовнішньому сервісу.
 
-postgres-mcp підключає AI-асистентів до **будь-якої бази даних PostgreSQL** через запити природною мовою. Ставте запитання звичайною мовою та отримуйте структуровані SQL-результати з автоматичним стрімінгом і надійною обробкою помилок.
+## Збірка
 
-**Працює з**: Cursor, Claude Desktop, розширеннями VS Code та будь-яким [MCP-сумісним клієнтом](https://modelcontextprotocol.io/)
-
-## Швидкий старт
-
-postgres-mcp підключається до **вашої наявної бази даних PostgreSQL** і робить її доступною для AI-асистентів через запити природною мовою.
-
-### Передумови
-- База даних PostgreSQL (наявна база з вашою схемою)
-- Ключ OpenAI API (необов'язково, для AI-генерації SQL)
-
-### Базове використання
-
-```bash
-# Налаштування змінних середовища
-export DATABASE_URL="postgres://user:password@localhost:5432/your-existing-db"
-export OPENAI_API_KEY="your-api-key"  # Необов'язково
-
-# Запуск сервера (з використанням готового бінарного файлу)
-./postgres-mcp-server
-
-# Тестування з клієнтом в іншому терміналі
-./postgres-mcp-client -ask "What tables do I have?" -format table
-./postgres-mcp-client -ask "Who is the customer that has placed the most orders?" -format table
-./postgres-mcp-client -search "john" -format table
-```
-
-Як це працює:
-
-```
-👤 Користувач / AI-асистент
-         │
-         │ "Who are the top customers?"
-         ▼
-┌─────────────────────────────────────────────────────────────┐
-│                  Будь-який MCP-клієнт                       │
-│                                                             │
-│  postgres-mcp CLI  │  Cursor  │  Claude Desktop  │  VS Code  │ ... │
-│  JSON/CSV   │  Чат     │  AI-асистент     │  Редактор │     │
-└─────────────────────────────────────────────────────────────┘
-         │
-         │ Streamable HTTP / MCP-протокол
-         ▼
-┌─────────────────────────────────────────────────────────────┐
-│                 Сервер postgres-mcp                         │
-│                                                             │
-│  🔒 Безпека     🧠 AI-рушій       🌊 Стрімінг               │
-│  • Валідація вводу • Кеш схеми    • Автопагінація           │
-│  • Аудит-лог    • OpenAI API      • Керування пам'яттю      │
-│  • SQL-захист   • Відновлення     • Пул з'єднань            │
-│                 після помилок                               │
-└─────────────────────────────────────────────────────────────┘
-         │
-         │ SQL-запити лише для читання
-         ▼
-┌─────────────────────────────────────────────────────────────┐
-│                Ваша база даних PostgreSQL                   │
-│                                                             │
-│  Будь-яка схема: e-commerce, аналітика, CRM тощо.           │
-│  Таблиці • Представлення • Індекси • Функції                │
-└─────────────────────────────────────────────────────────────┘
-
-Зовнішні AI-сервіси:
-OpenAI API • Anthropic • Локальні LLM (Ollama тощо)
-
-Ключові переваги:
-✅ Працює з БУДЬ-ЯКОЮ базою PostgreSQL (без припущень щодо схеми)
-✅ Не потребує змін схеми
-✅ Доступ лише для читання (100% безпечно)
-✅ Автоматичний стрімінг великих результатів
-✅ Розумне розуміння запитів (однина/множина)
-✅ Надійна обробка помилок (коректне відновлення після збоїв AI)
-✅ Підтримка чутливості PostgreSQL до регістру (таблиці зі змішаним регістром)
-✅ Готовність до продакшену: безпека та продуктивність
-✅ Універсальна сумісність із базами даних
-✅ Кілька форматів виводу (table, JSON, CSV)
-✅ Повнотекстовий пошук за всіма стовпцями
-✅ Підтримка автентифікації
-✅ Комплексний набір тестів
-```
-
-## Можливості
-
-- **Природна мова в SQL**: ставте запитання звичайною мовою
-- **Автоматичний стрімінг**: автоматично обробляє великі набори результатів
-- **Безпечний доступ лише для читання**: запобігає будь-яким операціям запису
-- **Текстовий пошук**: пошук за всіма текстовими стовпцями
-- **Кілька форматів виводу**: таблиця, JSON і CSV
-- **Чутливість PostgreSQL до регістру**: коректно обробляє імена таблиць зі змішаним регістром
-- **Універсальна сумісність**: працює з будь-якою базою даних PostgreSQL
-
-### Змінні середовища
-
-**Підключення до БД (один із двох варіантів):**
-- Варіант A — `DATABASE_URL`: рядок підключення PostgreSQL до вашої наявної бази даних
-- Варіант B — окремі змінні в стилі mssql-mcp (з них автоматично збирається `DATABASE_URL`):
-  - `POSTGRES_HOST` (`PGHOST` як fallback) — хост, напр. `localhost`
-  - `POSTGRES_PORT` (`PGPORT`, за замовчуванням `5432`)
-  - `POSTGRES_DATABASE` (`POSTGRES_DB` / `PGDATABASE`) — ім'я бази
-  - `POSTGRES_USER` (`POSTGRES_USERNAME` / `PGUSER`) — користувач
-  - `POSTGRES_PASSWORD` (`PGPASSWORD`, може бути порожнім для trust-автентифікації)
-  - `POSTGRES_SSLMODE` (`PGSSLMODE`, за замовчуванням `disable`) — `disable`, `require`, `verify-full` тощо.
-  - `POSTGRES_URL` — аліас для `DATABASE_URL` (якщо зручніше)
-
-**Необов'язкові:**
-- `OPENAI_API_KEY`: ключ OpenAI API для AI-генерації SQL
-- `OPENAI_MODEL`: модель для використання (за замовчуванням: "gpt-4o-mini")
-- `MCP_TRANSPORT`: `stdio` або `http` (за замовчуванням: `http`; прапорець `--transport stdio` має пріоритет)
-- `HTTP_ADDR`: адреса сервера в http-режимі (за замовчуванням: ":8080")
-- `HTTP_PATH`: шлях MCP-ендпоінта в http-режимі (за замовчуванням: "/mcp")
-- `AUTH_BEARER`: bearer-токен для автентифікації (тільки http-режим)
-
-## Встановлення
-
-### Завантаження готових бінарних файлів
-
-1. Перейдіть до [GitHub Releases](https://github.com/h0rn3t/postgres-mcp/releases)
-2. Завантажте бінарний файл для вашої платформи (Linux, macOS, Windows)
-3. Розпакуйте та запустіть:
-
-```bash
-# Приклад для macOS/Linux
-tar xzf postgres-mcp_*.tar.gz
-cd postgres-mcp_*
-./postgres-mcp-server
-```
-
-### Альтернативні варіанти
-
-```bash
-# Homebrew (macOS/Linux) — доступно після першого релізу
-brew tap h0rn3t/homebrew-tap
-brew install postgres-mcp
-
-# Збірка з вихідного коду
+```sh
 go build -o postgres-mcp-server ./server
 go build -o postgres-mcp-client ./client
 ```
 
-Додайте `-ldflags="-s -w -extldflags=-static" -trimpath`, якщо хочете отримати очищені виконувані файли (без налагоджувальної інформації):
-```console
-go build -ldflags="-s -w -extldflags=-static" -trimpath -o postgres-mcp-server ./server
-go build -ldflags="-s -w -extldflags=-static" -trimpath -o postgres-mcp-client ./client
-```
+## Налаштування сервера
 
-### Docker/Kubernetes
+Задайте `DATABASE_URL` або окремі параметри підключення:
 
-```bash
-# Docker
-docker run -e DATABASE_URL="postgres://user:pass@host:5432/db" \
-  -p 8080:8080 ghcr.io/h0rn3t/postgres-mcp:latest
-
-# Kubernetes (повні маніфести див. у каталозі examples/)
-kubectl create secret generic postgres-mcp-secret \
-  --from-literal=database-url="postgres://user:pass@host:5432/db"
-kubectl apply -f examples/k8s/
-```
-
-#### Швидкий старт
-
-```bash
-# Налаштування бази даних (необов'язково — працює з будь-якою наявною базою PostgreSQL)
-export DATABASE_URL="postgres://user:password@localhost:5432/mydb"
-psql $DATABASE_URL < schema.sql
-
-# Запуск сервера
-export OPENAI_API_KEY="your-api-key"
+```sh
+export DATABASE_URL='postgres://user:password@localhost:5432/mydb?sslmode=disable'
 ./postgres-mcp-server
-
-# Тестування з клієнтом
-./postgres-mcp-client -ask "Who is the user that places the most orders?" -format table
-./postgres-mcp-client -ask "Show me the top 40 most reviewed items in the marketplace" -format table
 ```
 
-### Змінні середовища
+Підтримуються змінні `POSTGRES_HOST`, `POSTGRES_PORT`, `POSTGRES_DATABASE`, `POSTGRES_USER`, `POSTGRES_PASSWORD` і `POSTGRES_SSLMODE`. Також можна використовувати відповідні `PG_HOST`, `PG_PORT`, `PG_DATABASE`, `PG_USER`, `PG_PASSWORD` і `PG_SSLMODE`. Якщо їх не задано, підтримуються імена libpq без підкреслення: `PGHOST`, `PGPORT` тощо.
 
-**Підключення до БД (один із двох варіантів):**
-- Варіант A — `DATABASE_URL`: рядок підключення PostgreSQL
-- Варіант B — окремі змінні в стилі mssql-mcp: `POSTGRES_HOST`, `POSTGRES_PORT` (за замовчуванням `5432`), `POSTGRES_DATABASE`, `POSTGRES_USER`, `POSTGRES_PASSWORD`, `POSTGRES_SSLMODE` (за замовчуванням `disable`)
+За замовчуванням сервер слухає Streamable HTTP на `:8080/mcp`. Щоб запустити його через stdio, задайте `MCP_TRANSPORT=stdio` або передайте `--transport stdio`. HTTP налаштовується змінними `HTTP_ADDR`, `HTTP_PATH` і, за потреби, `AUTH_BEARER`.
 
-**Необов'язкові:**
-- `OPENAI_API_KEY`: ключ OpenAI API для генерації SQL
-- `OPENAI_MODEL`: модель для використання (за замовчуванням: "gpt-4o-mini")
-- `MCP_TRANSPORT`: `stdio` або `http` (за замовчуванням: `http`)
-- `HTTP_ADDR`: адреса сервера в http-режимі (за замовчуванням: ":8080")
-- `HTTP_PATH`: шлях MCP-ендпоінта в http-режимі (за замовчуванням: "/mcp")
-- `AUTH_BEARER`: bearer-токен для автентифікації (тільки http-режим)
+| Змінна | За замовчуванням | Призначення |
+| --- | --- | --- |
+| `MAX_ROWS` | `50` | Максимум рядків для `query` |
+| `QUERY_TIMEOUT` | `25s` | Таймаут запиту |
+| `PG_ALLOW_WRITE` | `false` | Дозволяє `execute` надсилати SQL у PostgreSQL, якщо значення `true` |
+| `PG_ENABLE_RUNTIME_CONNECT` | `false` | Реєструє інструмент `connect_db`, якщо значення `true` |
 
-## Конфігурація в стилі mssql-mcp (stdio)
+## Інструменти MCP
 
-Якщо ви звикли до такого формату mssql-mcp:
+- `query`: виконує один запит лише для читання `SELECT`, `WITH`, `EXPLAIN` або `SHOW`. Для значень використовуйте `$1`, `$2` тощо та масив `params`. Кількість результатів обмежує `MAX_ROWS`: база зупиняється на ліміті й не читає решту рядків. Відповідь колонкова — `columns`, `rows` (масиви значень у порядку `columns`) і `truncated: true`, якщо рядків більше за ліміт. `uuid` і `interval` повертаються рядками, `bytea` — hex, значення довші за 500 байт обрізаються.
+- `list_schemas`: перелічує користувацькі схеми.
+- `list_tables`: перелічує таблиці й представлення у схемі; за замовчуванням `public`.
+- `describe_table`: повертає стовпці, типи, допустимість `NULL`, значення за замовчуванням і ознаки первинного ключа; за замовчуванням схема `public`.
+- `execute`: виконує один SQL-запит; кілька інструкцій в одному запиті відхиляються. Інструмент з'являється в списку лише з `PG_ALLOW_WRITE=true`.
+- `search`: шукає текст у текстових стовпцях бази.
+- `connect_db`: перемикає активну базу сервера на підключення з аргументів інструмента. Реєструється лише з `PG_ENABLE_RUNTIME_CONNECT=true`.
+
+`query` завжди працює в транзакції PostgreSQL лише для читання. `PG_ALLOW_WRITE` керує інструментом `execute` і не змінює режим `query`. Надавайте серверу роль PostgreSQL лише з потрібними правами.
+
+Приклад виклику MCP:
+
+```json
+{
+  "name": "query",
+  "arguments": {
+    "sql": "SELECT email FROM users WHERE id = $1",
+    "params": [42],
+    "max_rows": 50
+  }
+}
+```
+
+## Підключення до MCP-клієнтів
+
+Для локальної роботи зручніше stdio: клієнт сам запускає сервер окремим процесом, і HTTP-порт не потрібен. У прикладах нижче замініть `/path/to/postgres-mcp-server` на абсолютний шлях до зібраного бінарника. Замість `DATABASE_URL` у `env` можна передати `POSTGRES_HOST`, `POSTGRES_PORT`, `POSTGRES_DATABASE`, `POSTGRES_USER`, `POSTGRES_PASSWORD` і `POSTGRES_SSLMODE`, а прапорець `--transport stdio` можна замінити змінною `MCP_TRANSPORT=stdio`.
+
+Щоб підключитися до вже запущеного HTTP-сервера (наприклад, у Docker чи Kubernetes), використовуйте URL `http://host:8080/mcp`. Заголовок `Authorization: Bearer ...` потрібен, лише якщо сервер запущено з `AUTH_BEARER`.
+
+Не комітьте паролі в конфігураційні файли проєкту: там, де клієнт це підтримує, підставляйте їх зі змінних середовища.
+
+### Claude Code
+
+Додайте сервер командою (`--scope project` записує його в `.mcp.json` у корені проєкту, `--scope user` — для всіх проєктів):
+
+```sh
+claude mcp add postgres --scope project \
+  --env DATABASE_URL='postgres://user:password@localhost:5432/mydb?sslmode=disable' \
+  -- /path/to/postgres-mcp-server --transport stdio
+```
+
+Або напишіть `.mcp.json` вручну; `${DATABASE_URL}` Claude Code підставить із середовища, тож пароль не потрапить у репозиторій:
 
 ```json
 {
   "mcpServers": {
-    "mssql": {
-      "command": "/path/to/bin/mssql-mcp",
+    "postgres": {
+      "command": "/path/to/postgres-mcp-server",
+      "args": ["--transport", "stdio"],
       "env": {
-        "MSSQL_SERVER": "localhost",
-        "MSSQL_DATABASE": "YourDatabase",
-        "MSSQL_USERNAME": "sa",
-        "MSSQL_PASSWORD": "YourPassword",
-        "MSSQL_ENCRYPT": "true",
-        "MSSQL_TRUST_SERVER_CERTIFICATE": "true",
-        "MSSQL_ACCESS_LEVEL": "READONLY"
+        "DATABASE_URL": "${DATABASE_URL}"
       }
     }
   }
 }
 ```
 
-то для postgres-mcp еквівалент виглядає так (stdio-режим, окремий процес на клієнта, без HTTP-порта):
+HTTP-сервер:
+
+```sh
+claude mcp add --transport http postgres http://127.0.0.1:8080/mcp \
+  --header "Authorization: Bearer your-token"
+```
+
+Перевірити підключення можна командою `claude mcp list` або `/mcp` у сесії.
+
+### Codex
+
+Командою:
+
+```sh
+codex mcp add postgres \
+  --env DATABASE_URL='postgres://user:password@localhost:5432/mydb?sslmode=disable' \
+  -- /path/to/postgres-mcp-server --transport stdio
+```
+
+Або у файлі `~/.codex/config.toml`:
+
+```toml
+[mcp_servers.postgres]
+command = "/path/to/postgres-mcp-server"
+args = ["--transport", "stdio"]
+
+[mcp_servers.postgres.env]
+DATABASE_URL = "postgres://user:password@localhost:5432/mydb?sslmode=disable"
+```
+
+HTTP-сервер; токен Codex читає зі змінної середовища, назву якої задає `bearer_token_env_var`:
+
+```toml
+[mcp_servers.postgres]
+url = "http://127.0.0.1:8080/mcp"
+bearer_token_env_var = "POSTGRES_MCP_TOKEN"
+```
+
+### Cursor
+
+Файл `.cursor/mcp.json` у проєкті або `~/.cursor/mcp.json` для всіх проєктів; `${env:DATABASE_URL}` Cursor підставить із середовища:
 
 ```json
 {
   "mcpServers": {
     "postgres": {
-      "command": "/path/to/bin/postgres-mcp-server",
+      "command": "/path/to/postgres-mcp-server",
+      "args": ["--transport", "stdio"],
+      "env": {
+        "DATABASE_URL": "${env:DATABASE_URL}"
+      }
+    }
+  }
+}
+```
+
+HTTP-сервер:
+
+```json
+{
+  "mcpServers": {
+    "postgres": {
+      "url": "http://127.0.0.1:8080/mcp",
+      "headers": {
+        "Authorization": "Bearer your-token"
+      }
+    }
+  }
+}
+```
+
+### GitHub Copilot (VS Code)
+
+Файл `.vscode/mcp.json` у проєкті (або команда **MCP: Open User Configuration** для глобальних налаштувань). Інструменти доступні в режимі Agent чату Copilot. Блок `inputs` запитує пароль при першому запуску й зберігає його в захищеному сховищі VS Code, а не у файлі:
+
+```json
+{
+  "inputs": [
+    {
+      "type": "promptString",
+      "id": "pg-password",
+      "description": "PostgreSQL password",
+      "password": true
+    }
+  ],
+  "servers": {
+    "postgres": {
+      "type": "stdio",
+      "command": "/path/to/postgres-mcp-server",
       "args": ["--transport", "stdio"],
       "env": {
         "POSTGRES_HOST": "localhost",
         "POSTGRES_PORT": "5432",
-        "POSTGRES_DATABASE": "YourDatabase",
+        "POSTGRES_DATABASE": "mydb",
         "POSTGRES_USER": "postgres",
-        "POSTGRES_PASSWORD": "YourPassword",
-        "POSTGRES_SSLMODE": "disable",
-        "OPENAI_API_KEY": "your-api-key"
+        "POSTGRES_PASSWORD": "${input:pg-password}",
+        "POSTGRES_SSLMODE": "disable"
       }
     }
   }
 }
 ```
 
-Еквівалент одним рядком підключення (теж працює в stdio-режимі):
-
-```json
-{
-  "mcpServers": {
-    "postgres": {
-      "command": "/path/to/bin/postgres-mcp-server",
-      "args": ["--transport", "stdio"],
-      "env": {
-        "DATABASE_URL": "postgres://postgres:YourPassword@localhost:5432/YourDatabase?sslmode=disable",
-        "OPENAI_API_KEY": "your-api-key"
-      }
-    }
-  }
-}
-```
-
-> Примітки:
-> - `POSTGRES_SSLMODE`: `disable` для локального Docker/Postgres без TLS, `require` для хмарних БД (Neon, Supabase, RDS — зазвичай `require`).
-> - Замість прапорця `--transport stdio` можна задати `"MCP_TRANSPORT": "stdio"` в `env`.
-> - Доступ завжди лише для читання (аналог `MSSQL_ACCESS_LEVEL: READONLY`): сервер відхиляє INSERT/UPDATE/DELETE/DDL і виконує запити в read-only транзакціях.
-
-### VS Code
-
-Файл `.vscode/mcp.json` (або глобальний `mcp.json`):
+HTTP-сервер:
 
 ```json
 {
   "servers": {
     "postgres": {
-      "command": "/path/to/bin/postgres-mcp-server",
-      "args": ["--transport", "stdio"],
-      "env": {
-        "POSTGRES_HOST": "localhost",
-        "POSTGRES_PORT": "5432",
-        "POSTGRES_DATABASE": "YourDatabase",
-        "POSTGRES_USER": "postgres",
-        "POSTGRES_PASSWORD": "YourPassword",
-        "POSTGRES_SSLMODE": "disable"
+      "type": "http",
+      "url": "http://127.0.0.1:8080/mcp",
+      "headers": {
+        "Authorization": "Bearer your-token"
       }
     }
   }
 }
 ```
 
-### Claude Desktop
+### Примітки
 
-Файл `~/.config/claude-desktop/claude_desktop_config.json` (macOS/Linux) або `%APPDATA%\Claude\claude_desktop_config.json` (Windows):
+- `POSTGRES_SSLMODE` (або `sslmode` у `DATABASE_URL`): `disable` для локального Postgres без TLS, `require` для хмарних баз (RDS, Neon, Supabase).
+- За замовчуванням доступ лише для читання: `execute` не з'являється серед інструментів. Щоб дозволити запис, додайте в `env` `"PG_ALLOW_WRITE": "true"` і дайте ролі PostgreSQL лише потрібні права.
+- Логи сервер пише в stderr, тож вони не заважають протоколу в stdio-режимі. Детальніші логи — `"LOG_LEVEL": "debug"`.
 
-```json
-{
-  "mcpServers": {
-    "postgres": {
-      "command": "/path/to/bin/postgres-mcp-server",
-      "args": ["--transport", "stdio"],
-      "env": {
-        "DATABASE_URL": "postgres://postgres:YourPassword@localhost:5432/YourDatabase?sslmode=disable",
-        "OPENAI_API_KEY": "your-api-key"
-      }
-    }
-  }
-}
+## CLI
+
+За замовчуванням клієнт підключається до `http://127.0.0.1:8080/mcp`. Параметри `-url` і `-bearer` задають інший endpoint і bearer-токен.
+
+```sh
+./postgres-mcp-client -query 'SELECT id, email FROM users ORDER BY id LIMIT 20' -format table
+./postgres-mcp-client -query 'SELECT * FROM orders WHERE customer_id = 42' -format json
+./postgres-mcp-client -search 'john' -format csv
 ```
 
-### Хмарна БД (Neon / Supabase / RDS)
+Прапорець `-query` можна повторювати. Формати виводу: `table`, `json` і `csv`; параметр `-max-rows` задає ліміт, який клієнт запитує в сервера.
 
-```json
-{
-  "mcpServers": {
-    "postgres": {
-      "command": "/path/to/bin/postgres-mcp-server",
-      "args": ["--transport", "stdio"],
-      "env": {
-        "POSTGRES_HOST": "ep-xxx.neon.tech",
-        "POSTGRES_PORT": "5432",
-        "POSTGRES_DATABASE": "YourDatabase",
-        "POSTGRES_USER": "neondb_owner",
-        "POSTGRES_PASSWORD": "YourPassword",
-        "POSTGRES_SSLMODE": "require",
-        "OPENAI_API_KEY": "your-api-key"
-      }
-    }
-  }
-}
+## Docker і Kubernetes
+
+Зберіть образ командою `docker build -t postgres-mcp:local .` і запустіть із URL бази:
+
+```sh
+docker run -e DATABASE_URL='postgres://user:password@host:5432/mydb' -p 8080:8080 postgres-mcp:local
 ```
 
-### Локальний Postgres без пароля (trust auth)
-
-```json
-{
-  "mcpServers": {
-    "postgres": {
-      "command": "/path/to/bin/postgres-mcp-server",
-      "args": ["--transport", "stdio"],
-      "env": {
-        "POSTGRES_HOST": "localhost",
-        "POSTGRES_DATABASE": "YourDatabase",
-        "POSTGRES_USER": "postgres",
-        "POSTGRES_SSLMODE": "disable"
-      }
-    }
-  }
-}
-```
-
-### Docker в stdio-режимі
-
-```json
-{
-  "mcpServers": {
-    "postgres": {
-      "command": "docker",
-      "args": ["run", "-i", "--rm", "ghcr.io/h0rn3t/postgres-mcp:latest", "--transport", "stdio"],
-      "env": {
-        "DATABASE_URL": "postgres://postgres:YourPassword@host.docker.internal:5432/YourDatabase?sslmode=disable"
-      }
-    }
-  }
-}
-```
-
-### Перевірка конфігурації в терміналі
-
-```bash
-# 1. Збірка
-go build -o postgres-mcp-server ./server
-
-# 2. Без змінних — має сказати що саме відсутнє
-./postgres-mcp-server --transport stdio
-
-# 3. З POSTGRES_* — має піти далі (помилка підключення, а не конфігурації)
-POSTGRES_HOST=localhost POSTGRES_PORT=5432 POSTGRES_DATABASE=YourDatabase \
-POSTGRES_USER=postgres POSTGRES_PASSWORD=YourPassword \
-./postgres-mcp-server --transport stdio
-```
-
-## Приклади використання
-
-```bash
-# Запитання природною мовою
-./postgres-mcp-client -ask "What are the top 5 customers?" -format table
-./postgres-mcp-client -ask "How many orders were placed today?" -format json
-
-# Пошук за всіма текстовими полями
-./postgres-mcp-client -search "john" -format table
-
-# Кілька запитань одночасно
-./postgres-mcp-client -ask "Show tables" -ask "Count users" -format table
-
-# Різні формати виводу
-./postgres-mcp-client -ask "Export all data" -format csv -max-rows 1000
-```
-
-## Приклад бази даних
-
-Проєкт містить дві схеми:
-- **`schema.sql`**: повноцінний маркетплейс на кшталт Amazon із 5000+ записами
-- **`schema_minimal.sql`**: мінімальна тестова схема з таблицею `"Categories"` зі змішаним регістром
-
-**Ключові особливості:**
-- **Імена таблиць зі змішаним регістром** (`"Categories"`) для тестування чутливості до регістру
-- **Складені первинні ключі** (`order_items`) для тестування припущень AI
-- **Реалістичні зв'язки** та типи даних
-
-Використання власної бази даних:
-```bash
-export DATABASE_URL="postgres://user:pass@host:5432/your_db"
-./postgres-mcp-server
-./postgres-mcp-client -ask "What tables do I have?"
-```
-
-## Обробка помилок AI
-
-Коли AI генерує некоректний SQL, postgres-mcp коректно це обробляє:
-
-```json
-{
-  "error": "Column not found in generated query",
-  "suggestion": "Try rephrasing your question or ask about specific tables",
-  "original_sql": "SELECT non_existent_column FROM table..."
-}
-```
-
-Замість аварійного завершення система надає корисний зворотний зв'язок і продовжує працювати.
-
-## Інтеграція з MCP
-
-### Інтеграція з Cursor
-
-Варіант HTTP (сервер запущено окремо):
-
-```bash
-# Запуск сервера
-export DATABASE_URL="postgres://user:pass@localhost:5432/your_db"
-./postgres-mcp-server
-```
-
-Додайте до налаштувань Cursor:
-```json
-{
-  "mcp.servers": {
-    "postgres-mcp": {
-      "transport": {
-        "type": "http",
-        "url": "http://localhost:8080/mcp"
-      }
-    }
-  }
-}
-```
-
-Варіант stdio в стилі mssql-mcp (без окремого HTTP-сервера, див. розділ «Конфігурація в стилі mssql-mcp (stdio)»):
-```json
-{
-  "mcpServers": {
-    "postgres": {
-      "command": "/path/to/bin/postgres-mcp-server",
-      "args": ["--transport", "stdio"],
-      "env": {
-        "POSTGRES_HOST": "localhost",
-        "POSTGRES_PORT": "5432",
-        "POSTGRES_DATABASE": "YourDatabase",
-        "POSTGRES_USER": "postgres",
-        "POSTGRES_PASSWORD": "YourPassword",
-        "POSTGRES_SSLMODE": "disable",
-        "OPENAI_API_KEY": "your-api-key"
-      }
-    }
-  }
-}
-```
-
-### Інтеграція з Claude Desktop
-
-Варіант HTTP — відредагуйте `~/.config/claude-desktop/claude_desktop_config.json`:
-```json
-{
-  "mcpServers": {
-    "postgres-mcp": {
-      "transport": {
-        "type": "http",
-        "url": "http://localhost:8080/mcp"
-      }
-    }
-  }
-}
-```
-
-Варіант stdio в стилі mssql-mcp (без окремого HTTP-сервера, див. розділ «Конфігурація в стилі mssql-mcp (stdio)»):
-```json
-{
-  "mcpServers": {
-    "postgres": {
-      "command": "/path/to/bin/postgres-mcp-server",
-      "args": ["--transport", "stdio"],
-      "env": {
-        "DATABASE_URL": "postgres://postgres:YourPassword@localhost:5432/YourDatabase?sslmode=disable",
-        "OPENAI_API_KEY": "your-api-key"
-      }
-    }
-  }
-}
-```
-
-## Інструменти API
-
-- **`ask`**: запитання природною мовою → SQL-запити з автоматичним стрімінгом
-- **`search`**: повнотекстовий пошук за всіма текстовими стовпцями бази даних
-- **`stream`**: розширений стрімінг для дуже великих наборів результатів із пагінацією
-
-## Функції безпеки
-
-- **Примусовий режим лише для читання**: блокує операції запису (INSERT, UPDATE, DELETE тощо)
-- **Таймаути запитів**: запобігають довготривалим запитам
-- **Валідація вводу**: очищує та перевіряє весь ввід користувача
-- **Ізоляція транзакцій**: усі запити виконуються в транзакціях лише для читання
-
-## Тестування
-
-```bash
-# Юніт-тести
-go test ./server -v
-
-# Інтеграційні тести (потрібен PostgreSQL)
-go test ./server -tags=integration -v
-```
+Маніфести Kubernetes розташовані в [`examples/k8s`](examples/k8s). Передайте `DATABASE_URL` через Kubernetes Secret. Ключ моделі не потрібен.
 
 ## Ліцензія
 
-Apache 2.0 — деталі див. у файлі LICENSE.
-
-## Пов'язані проєкти
-
-- [Model Context Protocol](https://modelcontextprotocol.io/) — специфікація базового протоколу
-- [MCP Go SDK](https://github.com/modelcontextprotocol/go-sdk) — Go-реалізація MCP
-
----
-
-postgres-mcp робить вашу базу даних PostgreSQL доступною для AI-асистентів через природну мову, зберігаючи безпеку завдяки контролю доступу лише для читання.
+Apache 2.0. Деталі — у файлі [LICENSE](LICENSE).

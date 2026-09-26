@@ -8,9 +8,10 @@ import (
 	"flag"
 	"fmt"
 	"log"
+	"maps"
 	"net/http"
 	"os"
-	"sort"
+	"slices"
 	"strconv"
 	"strings"
 	"text/tabwriter"
@@ -26,10 +27,10 @@ var (
 	date    = "unknown"
 )
 
-type asksFlag []string
+type queriesFlag []string
 
-func (a *asksFlag) String() string     { return strings.Join(*a, "; ") }
-func (a *asksFlag) Set(v string) error { *a = append(*a, v); return nil }
+func (q *queriesFlag) String() string     { return strings.Join(*q, "; ") }
+func (q *queriesFlag) Set(v string) error { *q = append(*q, v); return nil }
 
 func main() {
 	url := getenv("POSTGRES_MCP_SERVER_URL", "http://127.0.0.1:8080/mcp")
@@ -39,10 +40,10 @@ func main() {
 	auth := flag.String("bearer", bearer, "Optional bearer token")
 	format := flag.String("format", "json", "Output format: table, json, csv")
 	verbose := flag.Bool("verbose", false, "Verbose output")
-	maxRows := flag.Int("max-rows", 1000, "Maximum rows to return (server auto-streams)")
+	maxRows := flag.Int("max-rows", 1000, "Maximum rows to return from each query")
 	versionFlag := flag.Bool("version", false, "Print version information and exit")
-	var asks asksFlag
-	flag.Var(&asks, "ask", "Plain-English question to run (repeatable)")
+	var queries queriesFlag
+	flag.Var(&queries, "query", "SQL query to run (repeatable)")
 	search := flag.String("search", "", "Optional free-text search string")
 	flag.Parse()
 
@@ -85,11 +86,11 @@ func main() {
 		fmt.Printf("Connected to server at %s\n", *serverURL)
 	}
 
-	for _, q := range asks {
+	for _, sql := range queries {
 		if *verbose {
-			fmt.Printf("Asking: %s\n", q)
+			fmt.Printf("Running SQL: %s\n", sql)
 		}
-		runAsk(ctx, session, q, *format, *verbose, *maxRows)
+		runQuery(ctx, session, sql, *format, *verbose, *maxRows)
 	}
 	if s := strings.TrimSpace(*search); s != "" {
 		if *verbose {
@@ -99,37 +100,8 @@ func main() {
 	}
 }
 
-func runAsk(ctx context.Context, session *mcp.ClientSession, question, format string, verbose bool, maxRows int) {
-	args := map[string]any{"query": question, "max_rows": maxRows}
-
-	if verbose {
-		fmt.Printf("Streaming query (max %d rows)...\n", maxRows)
-	}
-
-	res, err := session.CallTool(ctx, &mcp.CallToolParams{Name: "ask", Arguments: args})
-	if err != nil {
-		log.Fatalf("ask failed: %v", err)
-	}
-	if res.IsError {
-		printContent(res.Content)
-		log.Fatalf("ask returned error")
-	}
-
-	// Handle streaming response
-	if res.StructuredContent != nil {
-		var result map[string]any
-		b, _ := json.Marshal(res.StructuredContent)
-		if err := json.Unmarshal(b, &result); err == nil {
-			printFormattedResult(result, format, verbose)
-			return
-		}
-
-		// Fallback to original
-		b, _ = json.MarshalIndent(res.StructuredContent, "", "  ")
-		fmt.Println(string(b))
-		return
-	}
-	printContent(res.Content)
+func runQuery(ctx context.Context, session *mcp.ClientSession, sql, format string, verbose bool, maxRows int) {
+	call(ctx, session, "query", map[string]any{"sql": sql, "max_rows": maxRows}, format, verbose)
 }
 
 func runSearch(ctx context.Context, session *mcp.ClientSession, q, format string, verbose bool) {
@@ -147,36 +119,37 @@ func call(ctx context.Context, session *mcp.ClientSession, tool string, args map
 		log.Fatalf("%s returned error", tool)
 	}
 
-	if res.StructuredContent != nil {
-		// Convert to map and use enhanced formatting
-		var result map[string]any
-		b, _ := json.Marshal(res.StructuredContent)
-		if err := json.Unmarshal(b, &result); err == nil {
-			printFormattedResult(result, format, verbose)
-			return
+	// The server sends its result once, as JSON text, rather than as structured content.
+	if len(res.Content) == 1 {
+		if text, ok := res.Content[0].(*mcp.TextContent); ok {
+			var result map[string]any
+			if err := json.Unmarshal([]byte(text.Text), &result); err == nil {
+				printFormattedResult(result, format, verbose)
+				return
+			}
 		}
-
-		// Fallback to original
-		b, _ = json.MarshalIndent(res.StructuredContent, "", "  ")
-		fmt.Println(string(b))
-		return
 	}
 	printContent(res.Content)
 }
 
 func printFormattedResult(result map[string]any, format string, verbose bool) {
-	// Extract rows and SQL if present
+	// Extract rows if present
 	rows, hasRows := result["rows"].([]any)
-	sql, hasSQL := result["sql"].(string)
-	note, _ := result["note"].(string)
-
-	if verbose && hasSQL {
-		fmt.Printf("Generated SQL: %s\n\n", sql)
+	// Rows arrive as arrays in "columns" order; the printers take one map per row.
+	if columns, ok := result["columns"].([]any); ok {
+		for i, row := range rows {
+			values, _ := row.([]any)
+			record := make(map[string]any, len(columns))
+			for j, column := range columns {
+				if j < len(values) {
+					record[fmt.Sprint(column)] = values[j]
+				}
+			}
+			rows[i] = record
+		}
 	}
-
-	// Show streaming info if available in note
-	if verbose && note != "" && len(rows) > 50 {
-		fmt.Printf("Auto-streamed results: %s\n", note)
+	if truncated, _ := result["truncated"].(bool); truncated {
+		fmt.Fprintf(os.Stderr, "Results truncated after %d rows\n", len(rows))
 	}
 
 	if !hasRows || len(rows) == 0 {
@@ -230,11 +203,7 @@ func printTable(rows []any) {
 	}
 
 	// Sort column names for consistent output
-	var columns []string
-	for col := range columnSet {
-		columns = append(columns, col)
-	}
-	sort.Strings(columns)
+	columns := slices.Sorted(maps.Keys(columnSet))
 
 	// Create table writer
 	w := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
@@ -301,11 +270,7 @@ func printCSV(rows []any) {
 	}
 
 	// Sort column names for consistent output
-	var columns []string
-	for col := range columnSet {
-		columns = append(columns, col)
-	}
-	sort.Strings(columns)
+	columns := slices.Sorted(maps.Keys(columnSet))
 
 	// Create CSV writer
 	writer := csv.NewWriter(os.Stdout)

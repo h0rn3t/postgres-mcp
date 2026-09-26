@@ -25,9 +25,8 @@ func TestStreamableHTTPTransport(t *testing.T) {
 		DatabaseURL: os.Getenv("DATABASE_URL"),
 		QueryTO:     10 * time.Second,
 		MaxRows:     50,
-		SchemaTTL:   1 * time.Minute,
 	}
-	ctx := context.Background()
+	ctx := t.Context()
 	srv, err := newServer(ctx, cfg)
 	if err != nil {
 		t.Fatalf("newServer: %v", err)
@@ -44,16 +43,16 @@ func TestStreamableHTTPTransport(t *testing.T) {
 
 	// Create HTTP test server with streamable handler
 	handler := mcp.NewStreamableHTTPHandler(func(r *http.Request) *mcp.Server { return server }, nil)
-	testServer := httptest.NewServer(handler)
-	defer testServer.Close()
+	testServer := httptest.NewTestServer(t, handler)
+	httpClient := testServer.Client() // starts the in-memory server and fills testServer.URL
 
 	t.Run("streamable_http_headers", func(t *testing.T) {
 		// Test that the streamable HTTP transport returns correct headers
-		req, _ := http.NewRequest("POST", testServer.URL, strings.NewReader(`{"jsonrpc": "2.0", "method": "tools/list", "id": 1}`))
+		req, _ := http.NewRequestWithContext(t.Context(), "POST", testServer.URL, strings.NewReader(`{"jsonrpc": "2.0", "method": "tools/list", "id": 1}`))
 		req.Header.Set("Content-Type", "application/json")
 		req.Header.Set("Accept", "application/json, text/event-stream")
 
-		resp, err := http.DefaultClient.Do(req)
+		resp, err := httpClient.Do(req)
 		if err != nil {
 			t.Fatalf("HTTP request failed: %v", err)
 		}
@@ -76,11 +75,11 @@ func TestStreamableHTTPTransport(t *testing.T) {
 
 	t.Run("streamable_event_format", func(t *testing.T) {
 		// Test that responses use proper event-stream format
-		req, _ := http.NewRequest("POST", testServer.URL, strings.NewReader(`{"jsonrpc": "2.0", "method": "initialize", "params": {"protocolVersion": "2024-11-05", "capabilities": {}, "clientInfo": {"name": "test", "version": "1.0"}}, "id": 1}`))
+		req, _ := http.NewRequestWithContext(t.Context(), "POST", testServer.URL, strings.NewReader(`{"jsonrpc": "2.0", "method": "initialize", "params": {"protocolVersion": "2024-11-05", "capabilities": {}, "clientInfo": {"name": "test", "version": "1.0"}}, "id": 1}`))
 		req.Header.Set("Content-Type", "application/json")
 		req.Header.Set("Accept", "application/json, text/event-stream")
 
-		resp, err := http.DefaultClient.Do(req)
+		resp, err := httpClient.Do(req)
 		if err != nil {
 			t.Fatalf("HTTP request failed: %v", err)
 		}
@@ -108,14 +107,13 @@ func TestStreamableHTTPTransport(t *testing.T) {
 
 	t.Run("mcp_protocol_compliance", func(t *testing.T) {
 		// Test that we can use the MCP client properly with streamable transport
-		httpClient := &http.Client{}
 		tr := &mcp.StreamableClientTransport{
 			Endpoint:   testServer.URL,
 			HTTPClient: httpClient,
 		}
 
 		client := mcp.NewClient(&mcp.Implementation{Name: "test-client", Version: "1.0.0"}, nil)
-		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
 		defer cancel()
 
 		session, err := client.Connect(ctx, tr, nil)

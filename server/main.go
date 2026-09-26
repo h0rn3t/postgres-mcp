@@ -3,24 +3,27 @@ package main
 
 import (
 	"context"
+	"database/sql/driver"
+	"encoding/json/jsontext"
+	"encoding/json/v2"
 	"errors"
 	"flag"
 	"fmt"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
 	"os/signal"
-	"regexp"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
 	"time"
+	"uuid"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
-	openai "github.com/openai/openai-go/v2"
-	"github.com/openai/openai-go/v2/option"
 	"github.com/rs/zerolog"
 	"github.com/rs/zerolog/log"
 )
@@ -33,34 +36,26 @@ var (
 )
 
 const (
-	defaultSchemaTTL    = 5 * time.Minute
 	defaultQueryTimeout = 25 * time.Second
-	defaultMaxRows      = 200
-	maxModelTokens      = 2000
-	schemaMaxChars      = 18000
+	defaultMaxRows      = 50
 	maxRequestSize      = 1024 * 1024 // 1MB max request size
 	maxQueryLength      = 10000       // Max query length in characters
-	pageSize            = 50          // Default page size for pagination
-	maxPagesAuto        = 10          // Max pages to auto-fetch
+	maxCellBytes        = 500         // Longer values are cut so one cell cannot flood the model's context
 )
 
 type Server struct {
+	dbMu   sync.RWMutex
 	db     *pgxpool.Pool
-	llm    openai.Client // value type
-	model  string
-	cache  *SchemaCache
 	cfg    Config
 	server *http.Server
 }
 
 type Config struct {
-	DatabaseURL string
-	OpenAIKey   string
-	OpenAIModel string
-	OpenAIBase  string
-	SchemaTTL   time.Duration
-	QueryTO     time.Duration
-	MaxRows     int
+	DatabaseURL          string
+	QueryTO              time.Duration
+	MaxRows              int
+	AllowWrite           bool
+	EnableRuntimeConnect bool
 }
 
 // Validate checks if the configuration is valid and returns detailed errors
@@ -83,12 +78,6 @@ func (c *Config) Validate() error {
 		errs = append(errs, "QUERY_TIMEOUT cannot exceed 5 minutes")
 	}
 
-	if c.SchemaTTL < 30*time.Second {
-		errs = append(errs, "SCHEMA_TTL must be at least 30 seconds")
-	} else if c.SchemaTTL > 24*time.Hour {
-		errs = append(errs, "SCHEMA_TTL cannot exceed 24 hours")
-	}
-
 	if len(errs) > 0 {
 		return fmt.Errorf("configuration validation failed:\n  - %s", strings.Join(errs, "\n  - "))
 	}
@@ -96,134 +85,8 @@ func (c *Config) Validate() error {
 	return nil
 }
 
-type SchemaCache struct {
-	mu        sync.RWMutex
-	txt       string
-	expiresAt time.Time
-	ttl       time.Duration
-}
-
-func (c *SchemaCache) Get(ctx context.Context, db *pgxpool.Pool) (string, error) {
-	c.mu.RLock()
-	if time.Now().Before(c.expiresAt) && c.txt != "" {
-		defer c.mu.RUnlock()
-		return c.txt, nil
-	}
-	c.mu.RUnlock()
-
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	if time.Now().Before(c.expiresAt) && c.txt != "" {
-		return c.txt, nil
-	}
-	txt, err := loadSchema(ctx, db)
-	if err != nil {
-		return "", err
-	}
-	if len(txt) > schemaMaxChars {
-		txt = txt[:schemaMaxChars] + "\n-- ...truncated schema..."
-	}
-	c.txt = txt
-	c.expiresAt = time.Now().Add(c.ttl)
-	return c.txt, nil
-}
-
-func loadSchema(ctx context.Context, db *pgxpool.Pool) (string, error) {
-	q := `
-WITH cols AS (
-  SELECT n.nspname AS schema, c.relname AS table, a.attname AS column,
-         pg_catalog.format_type(a.atttypid, a.atttypmod) AS data_type,
-         (SELECT EXISTS (
-            SELECT 1 FROM pg_constraint
-            WHERE conrelid = c.oid AND contype='p' AND a.attnum = ANY(conkey)
-         )) AS is_pk
-  FROM pg_attribute a
-  JOIN pg_class c ON a.attrelid = c.oid
-  JOIN pg_namespace n ON c.relnamespace = n.oid
-  WHERE a.attnum > 0 AND NOT a.attisdropped AND c.relkind='r' AND n.nspname NOT IN ('pg_catalog','information_schema')
-),
-fks AS (
-  SELECT
-    n1.nspname AS src_schema, c1.relname AS src_table, a1.attname AS src_column,
-    n2.nspname AS dst_schema, c2.relname AS dst_table, a2.attname AS dst_column
-  FROM pg_constraint co
-  JOIN pg_class c1 ON co.conrelid=c1.oid
-  JOIN pg_namespace n1 ON c1.relnamespace=n1.oid
-  JOIN pg_class c2 ON co.confrelid=c2.oid
-  JOIN pg_namespace n2 ON c2.relnamespace=n2.oid
-  JOIN unnest(co.conkey) WITH ORDINALITY AS ck(attnum, pos) ON TRUE
-  JOIN unnest(co.confkey) WITH ORDINALITY AS fk(attnum, pos) ON ck.pos=fk.pos
-  JOIN pg_attribute a1 ON a1.attrelid=c1.oid AND a1.attnum=ck.attnum
-  JOIN pg_attribute a2 ON a2.attrelid=c2.oid AND a2.attnum=fk.attnum
-  WHERE co.contype='f'
-)
-SELECT
-  'TABLE '||cols.schema||'.'||
-  CASE 
-    WHEN cols.table ~ '^[a-z_][a-z0-9_]*$' THEN cols.table
-    ELSE '"' || cols.table || '"'
-  END ||'('||
-    string_agg(
-      CASE 
-        WHEN cols.column ~ '^[a-z_][a-z0-9_]*$' THEN cols.column
-        ELSE '"' || cols.column || '"'
-      END ||' '||cols.data_type||CASE WHEN cols.is_pk THEN ' PRIMARY KEY' ELSE '' END, 
-      ', ' ORDER BY cols.column
-    )||
-  ')' AS line
-FROM cols
-GROUP BY cols.schema, cols.table
-UNION ALL
-SELECT 'FK '||src_schema||'.'||
-  CASE 
-    WHEN src_table ~ '^[a-z_][a-z0-9_]*$' THEN src_table
-    ELSE '"' || src_table || '"'
-  END ||'('||
-  CASE 
-    WHEN src_column ~ '^[a-z_][a-z0-9_]*$' THEN src_column
-    ELSE '"' || src_column || '"'
-  END ||') -> '||dst_schema||'.'||
-  CASE 
-    WHEN dst_table ~ '^[a-z_][a-z0-9_]*$' THEN dst_table
-    ELSE '"' || dst_table || '"'
-  END ||'('||
-  CASE 
-    WHEN dst_column ~ '^[a-z_][a-z0-9_]*$' THEN dst_column
-    ELSE '"' || dst_column || '"'
-  END ||')'
-FROM fks
-ORDER BY 1;`
-
-	ctxTO, cancel := context.WithTimeout(ctx, 15*time.Second)
-	defer cancel()
-	rows, err := db.Query(ctxTO, q)
-	if err != nil {
-		return "", err
-	}
-	defer rows.Close()
-	var b strings.Builder
-	for rows.Next() {
-		var line string
-		if err := rows.Scan(&line); err != nil {
-			return "", err
-		}
-		b.WriteString(line)
-		b.WriteByte('\n')
-	}
-	return b.String(), rows.Err()
-}
-
 func mustConfig() Config {
 	var warnings []string
-
-	ttl := defaultSchemaTTL
-	if v := os.Getenv("SCHEMA_TTL"); v != "" {
-		if d, err := time.ParseDuration(v); err == nil {
-			ttl = d
-		} else {
-			warnings = append(warnings, fmt.Sprintf("invalid SCHEMA_TTL '%s': %v, using default %v", v, err, defaultSchemaTTL))
-		}
-	}
 
 	qto := defaultQueryTimeout
 	if v := os.Getenv("QUERY_TIMEOUT"); v != "" {
@@ -247,13 +110,11 @@ func mustConfig() Config {
 	databaseURL := resolveDatabaseURL()
 
 	cfg := Config{
-		DatabaseURL: databaseURL,
-		OpenAIKey:   os.Getenv("OPENAI_API_KEY"),
-		OpenAIModel: envDefault("OPENAI_MODEL", "gpt-4o-mini"),
-		OpenAIBase:  os.Getenv("OPENAI_BASE_URL"),
-		SchemaTTL:   ttl,
-		QueryTO:     qto,
-		MaxRows:     mr,
+		DatabaseURL:          databaseURL,
+		QueryTO:              qto,
+		MaxRows:              mr,
+		AllowWrite:           strings.EqualFold(strings.TrimSpace(os.Getenv("PG_ALLOW_WRITE")), "true"),
+		EnableRuntimeConnect: strings.EqualFold(strings.TrimSpace(os.Getenv("PG_ENABLE_RUNTIME_CONNECT")), "true"),
 	}
 
 	// Print warnings
@@ -269,13 +130,6 @@ func mustConfig() Config {
 	return cfg
 }
 
-func envOrDie(k string) string {
-	v := os.Getenv(k)
-	if v == "" {
-		log.Fatal().Msgf("missing required env %s", k)
-	}
-	return v
-}
 func envDefault(k, def string) string {
 	if v := os.Getenv(k); v != "" {
 		return v
@@ -294,14 +148,14 @@ func firstNonEmpty(vals ...string) string {
 
 // resolveDatabaseURL returns DATABASE_URL if set, otherwise builds it from
 // separate POSTGRES_* variables (mssql-mcp style config).
-// Supported variables (POSTGRES_* take precedence, PG* are fallbacks):
+// Supported variables (POSTGRES_* take precedence, then PG_* and libpq PG*):
 //
-//	POSTGRES_HOST / PGHOST (required if DATABASE_URL is not set)
-//	POSTGRES_PORT / PGPORT (default "5432")
-//	POSTGRES_DATABASE / POSTGRES_DB / PGDATABASE (required)
-//	POSTGRES_USER / POSTGRES_USERNAME / PGUSER (required)
-//	POSTGRES_PASSWORD / PGPASSWORD (may be empty for trust auth)
-//	POSTGRES_SSLMODE / PGSSLMODE (default "disable")
+//	POSTGRES_HOST / PG_HOST / PGHOST (required if DATABASE_URL is not set)
+//	POSTGRES_PORT / PG_PORT / PGPORT (default "5432")
+//	POSTGRES_DATABASE / POSTGRES_DB / PG_DATABASE / PGDATABASE (required)
+//	POSTGRES_USER / POSTGRES_USERNAME / PG_USER / PGUSER (required)
+//	POSTGRES_PASSWORD / PG_PASSWORD / PGPASSWORD (may be empty for trust auth)
+//	POSTGRES_SSLMODE / PG_SSLMODE / PGSSLMODE (default "disable")
 func resolveDatabaseURL() string {
 	if v := strings.TrimSpace(os.Getenv("DATABASE_URL")); v != "" {
 		return v
@@ -310,12 +164,12 @@ func resolveDatabaseURL() string {
 		return v
 	}
 
-	host := firstNonEmpty(os.Getenv("POSTGRES_HOST"), os.Getenv("PGHOST"))
-	port := firstNonEmpty(os.Getenv("POSTGRES_PORT"), os.Getenv("PGPORT"), "5432")
-	database := firstNonEmpty(os.Getenv("POSTGRES_DATABASE"), os.Getenv("POSTGRES_DB"), os.Getenv("PGDATABASE"))
-	user := firstNonEmpty(os.Getenv("POSTGRES_USER"), os.Getenv("POSTGRES_USERNAME"), os.Getenv("PGUSER"))
-	password := firstNonEmpty(os.Getenv("POSTGRES_PASSWORD"), os.Getenv("PGPASSWORD"))
-	sslmode := firstNonEmpty(os.Getenv("POSTGRES_SSLMODE"), os.Getenv("PGSSLMODE"), "disable")
+	host := firstNonEmpty(os.Getenv("POSTGRES_HOST"), os.Getenv("PG_HOST"), os.Getenv("PGHOST"))
+	port := firstNonEmpty(os.Getenv("POSTGRES_PORT"), os.Getenv("PG_PORT"), os.Getenv("PGPORT"), "5432")
+	database := firstNonEmpty(os.Getenv("POSTGRES_DATABASE"), os.Getenv("POSTGRES_DB"), os.Getenv("PG_DATABASE"), os.Getenv("PGDATABASE"))
+	user := firstNonEmpty(os.Getenv("POSTGRES_USER"), os.Getenv("POSTGRES_USERNAME"), os.Getenv("PG_USER"), os.Getenv("PGUSER"))
+	password := firstNonEmpty(os.Getenv("POSTGRES_PASSWORD"), os.Getenv("PG_PASSWORD"), os.Getenv("PGPASSWORD"))
+	sslmode := firstNonEmpty(os.Getenv("POSTGRES_SSLMODE"), os.Getenv("PG_SSLMODE"), os.Getenv("PGSSLMODE"), "disable")
 
 	if host == "" && database == "" && user == "" {
 		log.Fatal().Msg("missing required env DATABASE_URL (or POSTGRES_HOST/POSTGRES_PORT/POSTGRES_DATABASE/POSTGRES_USER/POSTGRES_PASSWORD)")
@@ -341,7 +195,15 @@ func resolveDatabaseURL() string {
 }
 
 func newServer(ctx context.Context, cfg Config) (*Server, error) {
-	conf, err := pgxpool.ParseConfig(cfg.DatabaseURL)
+	db, err := newPool(ctx, cfg.DatabaseURL)
+	if err != nil {
+		return nil, err
+	}
+	return &Server{db: db, cfg: cfg}, nil
+}
+
+func newPool(ctx context.Context, databaseURL string) (*pgxpool.Pool, error) {
+	conf, err := pgxpool.ParseConfig(databaseURL)
 	if err != nil {
 		return nil, err
 	}
@@ -351,7 +213,6 @@ func newServer(ctx context.Context, cfg Config) (*Server, error) {
 	conf.MaxConnIdleTime = 5 * time.Minute
 	conf.HealthCheckPeriod = 30 * time.Second
 	conf.ConnConfig.DefaultQueryExecMode = pgx.QueryExecModeSimpleProtocol
-
 	db, err := pgxpool.NewWithConfig(ctx, conf)
 	if err != nil {
 		return nil, err
@@ -363,22 +224,7 @@ func newServer(ctx context.Context, cfg Config) (*Server, error) {
 		return nil, err
 	}
 
-	var opts []option.RequestOption
-	if cfg.OpenAIKey != "" {
-		opts = append(opts, option.WithAPIKey(cfg.OpenAIKey))
-	}
-	if cfg.OpenAIBase != "" {
-		opts = append(opts, option.WithBaseURL(cfg.OpenAIBase))
-	}
-	llm := openai.NewClient(opts...) // value
-
-	return &Server{
-		db:    db,
-		llm:   llm,
-		model: cfg.OpenAIModel,
-		cache: &SchemaCache{ttl: cfg.SchemaTTL},
-		cfg:   cfg,
-	}, nil
+	return db, nil
 }
 
 // Shutdown gracefully shuts down the server
@@ -395,8 +241,12 @@ func (s *Server) Shutdown(ctx context.Context) error {
 	}
 
 	// Close database connections
-	if s.db != nil {
-		s.db.Close()
+	s.dbMu.Lock()
+	db := s.db
+	s.db = nil
+	s.dbMu.Unlock()
+	if db != nil {
+		db.Close()
 		log.Info().Msg("database connections closed")
 	}
 
@@ -459,62 +309,6 @@ func auditLog(event, user, query, result string, success bool) {
 		Msg("audit_log")
 }
 
-// isExpensiveQuery detects potentially expensive query patterns
-func isExpensiveQuery(sql string) bool {
-	sqlLower := strings.ToLower(sql)
-
-	// Detect expensive patterns (generic)
-	expensivePatterns := []string{
-		"cross join", // Cartesian products
-		"left join",  // LEFT JOINs can be expensive
-	}
-
-	for _, pattern := range expensivePatterns {
-		if strings.Contains(sqlLower, pattern) {
-			return true
-		}
-	}
-
-	// Count number of JOINs - more than 2 is expensive
-	joinCount := strings.Count(sqlLower, " join ")
-	return joinCount > 2
-}
-
-// simplifyExpensiveQuery rewrites expensive queries to be more performant
-func simplifyExpensiveQuery(sql, originalQuery string) string {
-	sqlLower := strings.ToLower(sql)
-
-	// For queries with expensive JOINs, return a helpful error message instead
-	if strings.Contains(sqlLower, "left join") || strings.Contains(sqlLower, "cross join") || strings.Count(sqlLower, " join ") > 2 {
-		return "SELECT 'Query too complex - please try a simpler question or ask about individual tables' AS message LIMIT 1"
-	}
-
-	return sql // Return original if no simplification needed
-}
-
-func validateSQLBasic(sql string) error {
-	sqlLower := strings.ToLower(sql)
-
-	// Check for basic SQL structure
-	if !strings.Contains(sqlLower, "select") {
-		return fmt.Errorf("query must contain SELECT")
-	}
-
-	// Check for balanced parentheses
-	openCount := strings.Count(sql, "(")
-	closeCount := strings.Count(sql, ")")
-	if openCount != closeCount {
-		return fmt.Errorf("unbalanced parentheses: %d open, %d close", openCount, closeCount)
-	}
-
-	// Check for common syntax issues
-	if strings.Contains(sqlLower, "select select") {
-		return fmt.Errorf("duplicate SELECT keywords detected")
-	}
-
-	return nil
-}
-
 // requestSizeLimitMiddleware limits the size of incoming requests
 func requestSizeLimitMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -525,196 +319,295 @@ func requestSizeLimitMiddleware(next http.Handler) http.Handler {
 
 // ---------- MCP tool handlers ----------
 
-type askInput struct {
-	Query     string `json:"query"`
-	MaxRows   int    `json:"max_rows,omitempty"`
-	DryRun    bool   `json:"dry_run,omitempty"`
-	Page      int    `json:"page,omitempty"`       // Page number (0-based)
-	PageSize  int    `json:"page_size,omitempty"`  // Results per page
-	StreamAll bool   `json:"stream_all,omitempty"` // Auto-fetch all pages
+type queryInput struct {
+	SQL     string `json:"sql"`
+	Params  []any  `json:"params,omitempty"`
+	MaxRows int    `json:"max_rows,omitempty"`
 }
 
-type askOutput struct {
-	SQL        string           `json:"sql"`
-	Rows       []map[string]any `json:"rows,omitempty"`
-	Note       string           `json:"note,omitempty"`
-	Page       int              `json:"page,omitempty"`
-	PageSize   int              `json:"page_size,omitempty"`
-	TotalCount int              `json:"total_count,omitempty"`
-	HasMore    bool             `json:"has_more"`
-	NextPage   int              `json:"next_page,omitempty"`
+// rowsOutput is columnar: column names travel once instead of once per row.
+type rowsOutput struct {
+	Columns   []string `json:"columns"`
+	Rows      [][]any  `json:"rows"`
+	Truncated bool     `json:"truncated,omitzero"`
 }
 
-type streamInput struct {
-	Query    string `json:"query"`
-	MaxPages int    `json:"max_pages,omitempty"` // Max pages to fetch (default 10)
-	PageSize int    `json:"page_size,omitempty"` // Results per page (default 50)
+func (s *Server) handleQuery(ctx context.Context, _ *mcp.CallToolRequest, in queryInput) (*mcp.CallToolResult, rowsOutput, error) {
+	sql := strings.TrimSpace(in.SQL)
+	if err := validateSQLInput(sql); err != nil {
+		return nil, rowsOutput{}, err
+	}
+	limit := s.cfg.MaxRows
+	if in.MaxRows > 0 && in.MaxRows < limit {
+		limit = in.MaxRows
+	}
+	switch strings.ToUpper(strings.Fields(sql)[0]) {
+	case "SELECT", "WITH", "EXPLAIN", "SHOW":
+	default:
+		return nil, rowsOutput{}, errors.New("query must start with SELECT, WITH, EXPLAIN, or SHOW")
+	}
+	out, err := s.runReadOnlyQuery(ctx, sql, in.Params, limit)
+	return nil, out, err
 }
 
-type streamOutput struct {
-	SQL        string             `json:"sql"`
-	Pages      []streamPageOutput `json:"pages"`
-	TotalRows  int                `json:"total_rows"`
-	TotalPages int                `json:"total_pages"`
-	Note       string             `json:"note,omitempty"`
+type executeInput struct {
+	SQL    string `json:"sql"`
+	Params []any  `json:"params,omitempty"`
 }
 
-type streamPageOutput struct {
-	Page int              `json:"page"`
-	Rows []map[string]any `json:"rows"`
+type executeOutput struct {
+	Command  string `json:"command"`
+	RowCount int64  `json:"row_count"`
 }
 
-func (s *Server) handleAsk(ctx context.Context, req *mcp.CallToolRequest, in askInput) (*mcp.CallToolResult, askOutput, error) {
-	start := time.Now()
-	clientIP := "unknown" // MCP doesn't expose client IP directly
-
-	log.Debug().Str("tool", "ask").Str("query", strings.TrimSpace(in.Query)).
-		Int("max_rows", in.MaxRows).Bool("dry_run", in.DryRun).Int("page", in.Page).
-		Int("page_size", in.PageSize).Bool("stream_all", in.StreamAll).Str("client_ip", clientIP).Msg("request")
-
-	// Input sanitization and validation
-	if err := sanitizeInput(in.Query); err != nil {
-		auditLog("ask_input_validation_failed", clientIP, in.Query, err.Error(), false)
-		log.Debug().Str("tool", "ask").Err(err).Msg("input validation failed")
-		return nil, askOutput{}, err
+func (s *Server) handleExecute(ctx context.Context, _ *mcp.CallToolRequest, in executeInput) (*mcp.CallToolResult, executeOutput, error) {
+	sql := strings.TrimSpace(in.SQL)
+	if err := validateSQLInput(sql); err != nil {
+		return nil, executeOutput{}, err
+	}
+	if !s.cfg.AllowWrite {
+		return nil, executeOutput{}, errors.New("writes are disabled; set PG_ALLOW_WRITE=true to enable execute")
 	}
 
-	schemaTxt, err := s.cache.Get(ctx, s.db)
+	s.dbMu.RLock()
+	defer s.dbMu.RUnlock()
+	ctxTO, cancel := context.WithTimeout(ctx, s.cfg.QueryTO)
+	defer cancel()
+	// Extended protocol binds values and keeps writes to one statement; the exec
+	// mode does it in one round trip without caching one-off statements. Query,
+	// not Exec: pgx sends an Exec without arguments over the simple protocol,
+	// which runs every statement in the string.
+	execArgs := append([]any{pgx.QueryExecModeExec}, in.Params...)
+	rows, err := s.db.Query(ctxTO, sql, execArgs...)
 	if err != nil {
-		log.Debug().Str("tool", "ask").Err(err).Msg("schema load failed")
-		return nil, askOutput{}, err
+		return nil, executeOutput{}, err
 	}
-
-	// Determine page size
-	pageSize := minNonZero(in.PageSize, pageSize)
-	if in.MaxRows > 0 {
-		pageSize = minNonZero(in.MaxRows, pageSize)
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return nil, executeOutput{}, err
 	}
+	tag := rows.CommandTag()
+	return nil, executeOutput{Command: tag.String(), RowCount: tag.RowsAffected()}, nil
+}
 
-	sql, note, err := s.generateSQL(ctx, in.Query, schemaTxt, pageSize*10) // Generate SQL for larger limit
+func validateSQLInput(sql string) error {
+	if sql == "" {
+		return errors.New("sql cannot be empty")
+	}
+	if len(sql) > maxQueryLength {
+		return fmt.Errorf("sql too long: %d characters (max %d)", len(sql), maxQueryLength)
+	}
+	return nil
+}
+
+type listSchemasOutput struct {
+	Schemas []string `json:"schemas"`
+}
+
+func (s *Server) handleListSchemas(ctx context.Context, _ *mcp.CallToolRequest, _ struct{}) (*mcp.CallToolResult, listSchemasOutput, error) {
+	s.dbMu.RLock()
+	defer s.dbMu.RUnlock()
+	ctxTO, cancel := context.WithTimeout(ctx, s.cfg.QueryTO)
+	defer cancel()
+	rows, err := s.db.Query(ctxTO, `
+SELECT schema_name
+FROM information_schema.schemata
+WHERE schema_name <> 'information_schema' AND left(schema_name, 3) <> 'pg_'
+ORDER BY schema_name`)
 	if err != nil {
-		auditLog("ask_sql_generation_failed", clientIP, in.Query, err.Error(), false)
-		log.Debug().Str("tool", "ask").Err(err).Msg("sql generation failed")
-		return nil, askOutput{}, err
+		return nil, listSchemasOutput{}, err
 	}
-	log.Debug().Str("tool", "ask").Str("sql", sql).Msg("generated sql")
+	defer rows.Close()
 
-	if in.DryRun {
-		if err := guardReadOnly(sql); err != nil {
-			auditLog("ask_dry_run_guard_failed", clientIP, sql, err.Error(), false)
-			log.Debug().Str("tool", "ask").Err(err).Dur("dur", time.Since(start)).Msg("dry-run guard failed")
-			return nil, askOutput{SQL: sql, Note: note}, err
+	schemas := make([]string, 0)
+	for rows.Next() {
+		var schema string
+		if err := rows.Scan(&schema); err != nil {
+			return nil, listSchemasOutput{}, err
 		}
-		auditLog("ask_dry_run_success", clientIP, in.Query, sql, true)
-		log.Debug().Str("tool", "ask").Dur("dur", time.Since(start)).Msg("dry-run ok")
-		return nil, askOutput{SQL: sql, Note: note}, nil
+		schemas = append(schemas, schema)
 	}
-
-	if err := guardReadOnly(sql); err != nil {
-		auditLog("ask_guard_failed", clientIP, sql, err.Error(), false)
-		log.Debug().Str("tool", "ask").Err(err).Dur("dur", time.Since(start)).Msg("guard failed")
-		return nil, askOutput{SQL: sql}, err
+	if err := rows.Err(); err != nil {
+		return nil, listSchemasOutput{}, err
 	}
+	return nil, listSchemasOutput{Schemas: schemas}, nil
+}
 
-	// Check for potentially expensive queries and simplify them
-	if isExpensiveQuery(sql) {
-		log.Warn().Str("sql", sql).Msg("potentially expensive query detected - simplifying")
-		sql = simplifyExpensiveQuery(sql, in.Query)
-		log.Info().Str("simplified_sql", sql).Msg("query simplified for performance")
+type listTablesInput struct {
+	Schema string `json:"schema,omitempty"`
+}
+
+type listTablesOutput struct {
+	Tables []string `json:"tables"`
+}
+
+func (s *Server) handleListTables(ctx context.Context, _ *mcp.CallToolRequest, in listTablesInput) (*mcp.CallToolResult, listTablesOutput, error) {
+	schema := strings.TrimSpace(in.Schema)
+	if schema == "" {
+		schema = "public"
 	}
-
-	// Validate SQL syntax before execution (basic check)
-	if err := validateSQLBasic(sql); err != nil {
-		log.Warn().Str("sql", sql).Err(err).Msg("generated SQL may have issues")
-		// Continue anyway - let the database provide the real error
-	}
-
-	// Automatically stream all results
-	maxPages := 20 // Auto-stream up to 20 pages (1000 results with default page size)
-	if in.MaxRows > 0 {
-		maxPages = (in.MaxRows + pageSize - 1) / pageSize // Calculate pages needed
-	}
-
-	pages, totalRows, err := s.runStreamingQuery(ctx, sql, maxPages, pageSize)
+	s.dbMu.RLock()
+	defer s.dbMu.RUnlock()
+	ctxTO, cancel := context.WithTimeout(ctx, s.cfg.QueryTO)
+	defer cancel()
+	rows, err := s.db.Query(ctxTO, `
+SELECT table_name
+FROM information_schema.tables
+WHERE table_schema = $1 AND table_type IN ('BASE TABLE', 'VIEW')
+ORDER BY table_name`, schema)
 	if err != nil {
-		// If query failed due to column errors, try to provide a helpful response
-		if strings.Contains(err.Error(), "column") && strings.Contains(err.Error(), "does not exist") {
-			auditLog("ask_query_failed", clientIP, sql, err.Error(), false)
-			log.Debug().Str("tool", "ask").Err(err).Dur("dur", time.Since(start)).Msg("query failed - column not found")
+		return nil, listTablesOutput{}, err
+	}
+	defer rows.Close()
 
-			// Return helpful error message instead of failing
-			errorRows := []map[string]any{
-				{
-					"error":        "Column not found in generated query",
-					"suggestion":   "Try rephrasing your question or ask about specific tables",
-					"original_sql": sql,
-				},
-			}
-			return nil, askOutput{
-				SQL:  sql,
-				Rows: errorRows,
-				Note: note + " (query failed - column not found)",
-			}, nil
+	tables := make([]string, 0)
+	for rows.Next() {
+		var table string
+		if err := rows.Scan(&table); err != nil {
+			return nil, listTablesOutput{}, err
 		}
+		tables = append(tables, table)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, listTablesOutput{}, err
+	}
+	return nil, listTablesOutput{Tables: tables}, nil
+}
 
-		// Handle table/relation errors gracefully
-		if strings.Contains(err.Error(), "relation") && strings.Contains(err.Error(), "does not exist") {
-			auditLog("ask_query_failed", clientIP, sql, err.Error(), false)
-			log.Debug().Str("tool", "ask").Err(err).Dur("dur", time.Since(start)).Msg("query failed - table not found")
+type describeTableInput struct {
+	Table  string `json:"table"`
+	Schema string `json:"schema,omitempty"`
+}
 
-			errorRows := []map[string]any{
-				{
-					"error":        "Table not found in generated query",
-					"suggestion":   "Check available tables or rephrase your question",
-					"original_sql": sql,
-				},
-			}
-			return nil, askOutput{
-				SQL:  sql,
-				Rows: errorRows,
-				Note: note + " (query failed - table not found)",
-			}, nil
+type tableColumn struct {
+	Name       string  `json:"name"`
+	DataType   string  `json:"data_type"`
+	Nullable   bool    `json:"nullable"`
+	Default    *string `json:"default,omitempty"`
+	PrimaryKey bool    `json:"primary_key"`
+}
+
+type describeTableOutput struct {
+	Schema  string        `json:"schema"`
+	Table   string        `json:"table"`
+	Columns []tableColumn `json:"columns"`
+}
+
+func (s *Server) handleDescribeTable(ctx context.Context, _ *mcp.CallToolRequest, in describeTableInput) (*mcp.CallToolResult, describeTableOutput, error) {
+	table := strings.TrimSpace(in.Table)
+	if table == "" {
+		return nil, describeTableOutput{}, errors.New("table cannot be empty")
+	}
+	schema := strings.TrimSpace(in.Schema)
+	if schema == "" {
+		schema = "public"
+	}
+	s.dbMu.RLock()
+	defer s.dbMu.RUnlock()
+	ctxTO, cancel := context.WithTimeout(ctx, s.cfg.QueryTO)
+	defer cancel()
+	rows, err := s.db.Query(ctxTO, `
+SELECT c.column_name, c.data_type, c.is_nullable = 'YES', c.column_default,
+       EXISTS (
+           SELECT 1
+           FROM information_schema.key_column_usage k
+           JOIN information_schema.table_constraints t
+             ON t.constraint_catalog = k.constraint_catalog
+            AND t.constraint_schema = k.constraint_schema
+            AND t.constraint_name = k.constraint_name
+           WHERE t.constraint_type = 'PRIMARY KEY'
+             AND k.table_schema = c.table_schema
+             AND k.table_name = c.table_name
+             AND k.column_name = c.column_name
+       )
+FROM information_schema.columns c
+WHERE c.table_schema = $1 AND c.table_name = $2
+ORDER BY c.ordinal_position`, schema, table)
+	if err != nil {
+		return nil, describeTableOutput{}, err
+	}
+	defer rows.Close()
+
+	columns := make([]tableColumn, 0)
+	for rows.Next() {
+		var column tableColumn
+		var defaultValue *string
+		if err := rows.Scan(&column.Name, &column.DataType, &column.Nullable, &defaultValue, &column.PrimaryKey); err != nil {
+			return nil, describeTableOutput{}, err
 		}
+		column.Default = defaultValue
+		columns = append(columns, column)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, describeTableOutput{}, err
+	}
+	if len(columns) == 0 {
+		return nil, describeTableOutput{}, fmt.Errorf("table %q not found in schema %q", table, schema)
+	}
+	return nil, describeTableOutput{Schema: schema, Table: table, Columns: columns}, nil
+}
 
-		// Handle syntax errors gracefully
-		if strings.Contains(err.Error(), "syntax error") {
-			auditLog("ask_query_failed", clientIP, sql, err.Error(), false)
-			log.Debug().Str("tool", "ask").Err(err).Dur("dur", time.Since(start)).Msg("query failed - syntax error")
+type connectDBInput struct {
+	Host     string `json:"host"`
+	Port     int    `json:"port,omitempty"`
+	User     string `json:"user"`
+	Password string `json:"password,omitempty"`
+	Database string `json:"database"`
+	SSLMode  string `json:"sslmode,omitempty"`
+}
 
-			errorRows := []map[string]any{
-				{
-					"error":        "SQL syntax error in generated query",
-					"suggestion":   "Try rephrasing your question more clearly",
-					"original_sql": sql,
-				},
-			}
-			return nil, askOutput{
-				SQL:  sql,
-				Rows: errorRows,
-				Note: note + " (query failed - syntax error)",
-			}, nil
-		}
+type connectDBOutput struct {
+	Connected bool   `json:"connected"`
+	Host      string `json:"host"`
+	Database  string `json:"database"`
+}
 
-		auditLog("ask_query_failed", clientIP, sql, err.Error(), false)
-		log.Debug().Str("tool", "ask").Err(err).Dur("dur", time.Since(start)).Msg("query failed")
-		return nil, askOutput{SQL: sql}, err
+func (s *Server) handleConnectDB(ctx context.Context, _ *mcp.CallToolRequest, in connectDBInput) (*mcp.CallToolResult, connectDBOutput, error) {
+	if !s.cfg.EnableRuntimeConnect {
+		return nil, connectDBOutput{}, errors.New("runtime connection switching is disabled; set PG_ENABLE_RUNTIME_CONNECT=true to enable connect_db")
+	}
+	in.Host = strings.TrimSpace(in.Host)
+	in.User = strings.TrimSpace(in.User)
+	in.Database = strings.TrimSpace(in.Database)
+	if in.Host == "" || in.User == "" || in.Database == "" {
+		return nil, connectDBOutput{}, errors.New("host, user, and database are required")
+	}
+	if in.Port == 0 {
+		in.Port = 5432
+	}
+	if in.Port < 1 || in.Port > 65535 {
+		return nil, connectDBOutput{}, errors.New("port must be between 1 and 65535")
+	}
+	sslmode := strings.TrimSpace(in.SSLMode)
+	if sslmode == "" {
+		sslmode = "disable"
+	}
+	connURL := &url.URL{
+		Scheme: "postgres",
+		Host:   net.JoinHostPort(in.Host, strconv.Itoa(in.Port)),
+		Path:   "/" + in.Database,
+		User:   url.UserPassword(in.User, in.Password),
+	}
+	params := connURL.Query()
+	params.Set("sslmode", sslmode)
+	connURL.RawQuery = params.Encode()
+
+	ctxTO, cancel := context.WithTimeout(ctx, s.cfg.QueryTO)
+	defer cancel()
+	db, err := newPool(ctxTO, connURL.String())
+	if err != nil {
+		return nil, connectDBOutput{}, fmt.Errorf("connect to database: %w", err)
 	}
 
-	// Flatten all pages into single result
-	var allRows []map[string]any
-	for _, page := range pages {
-		allRows = append(allRows, page.Rows...)
+	s.dbMu.Lock()
+	oldDB := s.db
+	s.db = db
+	s.dbMu.Unlock()
+	if oldDB != nil {
+		oldDB.Close()
 	}
-
-	auditLog("ask_success", clientIP, in.Query, fmt.Sprintf("streamed %d rows across %d pages", totalRows, len(pages)), true)
-	log.Debug().Str("tool", "ask").Int("total_rows", totalRows).Int("pages", len(pages)).
-		Int("returned_rows", len(allRows)).Dur("dur", time.Since(start)).Msg("done")
-
-	return nil, askOutput{
-		SQL:  sql,
-		Rows: allRows,
-		Note: fmt.Sprintf("%s (streamed %d pages)", note, len(pages)),
-	}, nil
+	auditLog("runtime_database_connected", "mcp", "", in.Host+"/"+in.Database, true)
+	return nil, connectDBOutput{Connected: true, Host: in.Host, Database: in.Database}, nil
 }
 
 type searchInput struct {
@@ -722,12 +615,7 @@ type searchInput struct {
 	Limit int    `json:"limit,omitempty"`
 }
 
-type searchOutput struct {
-	SQL  string           `json:"sql"`
-	Rows []map[string]any `json:"rows"`
-}
-
-func (s *Server) handleSearch(ctx context.Context, req *mcp.CallToolRequest, in searchInput) (*mcp.CallToolResult, searchOutput, error) {
+func (s *Server) handleSearch(ctx context.Context, req *mcp.CallToolRequest, in searchInput) (*mcp.CallToolResult, rowsOutput, error) {
 	start := time.Now()
 	clientIP := "unknown" // MCP doesn't expose client IP directly
 
@@ -737,310 +625,154 @@ func (s *Server) handleSearch(ctx context.Context, req *mcp.CallToolRequest, in 
 	if err := sanitizeInput(in.Q); err != nil {
 		auditLog("search_input_validation_failed", clientIP, in.Q, err.Error(), false)
 		log.Debug().Str("tool", "search").Err(err).Msg("input validation failed")
-		return nil, searchOutput{}, err
+		return nil, rowsOutput{}, err
 	}
 	limit := minNonZero(in.Limit, 50)
-	sql, err := s.buildSearchSQL(ctx, in.Q, limit)
+	sql, args, err := s.buildSearchSQL(ctx, in.Q, limit)
 	if err != nil {
 		auditLog("search_sql_build_failed", clientIP, in.Q, err.Error(), false)
 		log.Debug().Str("tool", "search").Err(err).Msg("build sql failed")
-		return nil, searchOutput{}, err
+		return nil, rowsOutput{}, err
 	}
 	log.Debug().Str("tool", "search").Str("sql", sql).Msg("generated sql")
 
-	rows, err := s.runReadOnlyQuery(ctx, sql, limit)
+	// The generated SQL stays in the logs: it runs to thousands of tokens and the model cannot use it.
+	out, err := s.runReadOnlyQuery(ctx, sql, args, limit)
 	if err != nil {
 		auditLog("search_query_failed", clientIP, sql, err.Error(), false)
 		log.Debug().Str("tool", "search").Err(err).Dur("dur", time.Since(start)).Msg("query failed")
-		return nil, searchOutput{SQL: sql}, err
+		return nil, rowsOutput{}, err
 	}
-	auditLog("search_success", clientIP, in.Q, fmt.Sprintf("returned %d rows", len(rows)), true)
-	log.Debug().Str("tool", "search").Int("row_count", len(rows)).Dur("dur", time.Since(start)).Msg("done")
-	return nil, searchOutput{SQL: sql, Rows: rows}, nil
-}
-
-func (s *Server) handleStream(ctx context.Context, req *mcp.CallToolRequest, in streamInput) (*mcp.CallToolResult, streamOutput, error) {
-	start := time.Now()
-	clientIP := "unknown"
-
-	log.Debug().Str("tool", "stream").Str("query", strings.TrimSpace(in.Query)).
-		Int("max_pages", in.MaxPages).Int("page_size", in.PageSize).Str("client_ip", clientIP).Msg("request")
-
-	// Input sanitization and validation
-	if err := sanitizeInput(in.Query); err != nil {
-		auditLog("stream_input_validation_failed", clientIP, in.Query, err.Error(), false)
-		log.Debug().Str("tool", "stream").Err(err).Msg("input validation failed")
-		return nil, streamOutput{}, err
-	}
-
-	schemaTxt, err := s.cache.Get(ctx, s.db)
-	if err != nil {
-		log.Debug().Str("tool", "stream").Err(err).Msg("schema load failed")
-		return nil, streamOutput{}, err
-	}
-
-	// Parameters
-	maxPages := minNonZero(in.MaxPages, maxPagesAuto)
-	pageSize := minNonZero(in.PageSize, pageSize)
-
-	sql, note, err := s.generateSQL(ctx, in.Query, schemaTxt, pageSize*maxPages)
-	if err != nil {
-		auditLog("stream_sql_generation_failed", clientIP, in.Query, err.Error(), false)
-		log.Debug().Str("tool", "stream").Err(err).Msg("sql generation failed")
-		return nil, streamOutput{}, err
-	}
-
-	if err := guardReadOnly(sql); err != nil {
-		auditLog("stream_guard_failed", clientIP, sql, err.Error(), false)
-		log.Debug().Str("tool", "stream").Err(err).Msg("guard failed")
-		return nil, streamOutput{SQL: sql}, err
-	}
-
-	// Get all pages
-	pages, totalRows, err := s.runStreamingQuery(ctx, sql, maxPages, pageSize)
-	if err != nil {
-		auditLog("stream_query_failed", clientIP, sql, err.Error(), false)
-		log.Debug().Str("tool", "stream").Err(err).Dur("dur", time.Since(start)).Msg("query failed")
-		return nil, streamOutput{SQL: sql}, err
-	}
-
-	totalPages := (totalRows + pageSize - 1) / pageSize // Ceiling division
-
-	auditLog("stream_success", clientIP, in.Query, fmt.Sprintf("returned %d rows in %d pages", totalRows, len(pages)), true)
-	log.Debug().Str("tool", "stream").Int("total_rows", totalRows).Int("pages", len(pages)).
-		Dur("dur", time.Since(start)).Msg("done")
-
-	return nil, streamOutput{
-		SQL:        sql,
-		Pages:      pages,
-		TotalRows:  totalRows,
-		TotalPages: totalPages,
-		Note:       note,
-	}, nil
+	auditLog("search_success", clientIP, in.Q, fmt.Sprintf("returned %d rows", len(out.Rows)), true)
+	log.Debug().Str("tool", "search").Int("row_count", len(out.Rows)).Dur("dur", time.Since(start)).Msg("done")
+	return nil, out, nil
 }
 
 // ---------- SQL helpers ----------
 
-var mutating = regexp.MustCompile(`(?is)\b(INSERT|UPDATE|DELETE|UPSERT|MERGE|ALTER|DROP|TRUNCATE|VACUUM|REINDEX|GRANT|REVOKE|CREATE|COPY|ROLLBACK|COMMIT|BEGIN|START|SAVEPOINT|RELEASE|SET)\b`)
-
-func guardReadOnly(sql string) error {
-	if mutating.MatchString(sql) {
-		return fmt.Errorf("refusing to run non-read-only SQL")
+func (s *Server) runReadOnlyQuery(ctx context.Context, sql string, args []any, limit int) (rowsOutput, error) {
+	if limit <= 0 {
+		limit = defaultMaxRows
 	}
-	// disallow multiple statements
-	if strings.Count(sql, ";") > 0 && strings.TrimSpace(sql)[len(strings.TrimSpace(sql))-1] != ';' {
-		return fmt.Errorf("multiple statements not allowed")
-	}
-	return nil
-}
-
-func (s *Server) runReadOnlyQuery(ctx context.Context, sql string, limit int) ([]map[string]any, error) {
+	s.dbMu.RLock()
+	defer s.dbMu.RUnlock()
 	ctxTO, cancel := context.WithTimeout(ctx, s.cfg.QueryTO)
 	defer cancel()
 	conn, err := s.db.Acquire(ctxTO)
 	if err != nil {
-		return nil, err
+		return rowsOutput{}, err
 	}
 	defer conn.Release()
 
 	tx, err := conn.BeginTx(ctxTO, pgx.TxOptions{AccessMode: pgx.ReadOnly})
 	if err != nil {
-		return nil, err
+		return rowsOutput{}, err
 	}
-	defer tx.Rollback(ctxTO)
+	defer func() {
+		if err := tx.Rollback(ctxTO); err != nil && !errors.Is(err, pgx.ErrTxClosed) {
+			log.Warn().Err(err).Msg("read-only query rollback failed")
+		}
+	}()
 
-	if !regexp.MustCompile(`(?is)\bLIMIT\s+\d+`).MatchString(sql) {
-		sql = fmt.Sprintf("WITH q AS (%s) SELECT * FROM q LIMIT %d", sql, limit)
+	// Extended protocol binds values and keeps queries to one statement; the exec
+	// mode does it in one round trip without caching one-off statements.
+	queryArgs := append([]any{pgx.QueryExecModeExec}, args...)
+	if verb := strings.ToUpper(strings.Fields(sql)[0]); verb == "SELECT" || verb == "WITH" {
+		// A plain query streams every row and pgx drains the rest on Close, so a
+		// cursor lets the database stop at limit+1: the extra row marks truncation.
+		// Unlike a LIMIT wrapper it takes the SQL as written, trailing ";" and
+		// comments included. DECLARE goes through Query, not Exec: pgx sends an Exec
+		// without arguments over the simple protocol, which runs several statements,
+		// "COMMIT; DELETE ..." included.
+		declared, err := tx.Query(ctxTO, "DECLARE q NO SCROLL CURSOR FOR "+sql, queryArgs...)
+		if err != nil {
+			return rowsOutput{}, err
+		}
+		declared.Close()
+		if err := declared.Err(); err != nil {
+			return rowsOutput{}, err
+		}
+		sql, queryArgs = "FETCH "+strconv.Itoa(limit+1)+" FROM q", []any{pgx.QueryExecModeExec}
 	}
-	rows, err := tx.Query(ctxTO, sql)
+	rows, err := tx.Query(ctxTO, sql, queryArgs...)
 	if err != nil {
-		return nil, err
+		return rowsOutput{}, err
 	}
 	defer rows.Close()
 
-	flds := rows.FieldDescriptions()
-	out := make([]map[string]any, 0, 16)
+	var out rowsOutput
+	for _, f := range rows.FieldDescriptions() {
+		out.Columns = append(out.Columns, f.Name)
+	}
 	for rows.Next() {
+		if len(out.Rows) == limit {
+			out.Truncated = true
+			break
+		}
 		vals, err := rows.Values()
 		if err != nil {
-			return nil, err
+			return rowsOutput{}, err
 		}
-		row := make(map[string]any, len(flds))
-		for i, f := range flds {
-			row[string(f.Name)] = vals[i]
+		for i, v := range vals {
+			vals[i] = compactValue(v)
 		}
-		out = append(out, row)
+		out.Rows = append(out.Rows, vals)
 	}
 	if err := rows.Err(); err != nil {
-		return nil, err
-	}
-	if err := tx.Commit(ctxTO); err != nil {
-		return nil, err
+		return rowsOutput{}, err
 	}
 	return out, nil
 }
 
-// PaginatedResult holds pagination information
-type PaginatedResult struct {
-	Rows       []map[string]any
-	Page       int
-	PageSize   int
-	TotalCount int
-	HasMore    bool
-	NextPage   int
+// compactValue rewrites values whose default JSON wastes the model's tokens or
+// is unreadable: uuid as 16 numbers, bytea as base64, interval as a struct, and
+// text, jsonb or arrays long enough to crowd out the rest of the result.
+func compactValue(v any) any {
+	switch v := v.(type) {
+	case [16]byte:
+		return uuid.UUID(v).String()
+	case string:
+		return truncateCell(v)
+	case []byte:
+		if len(v) <= maxCellBytes/2 {
+			return fmt.Sprintf(`\x%x`, v)
+		}
+		return fmt.Sprintf(`\x%x…(%d bytes)`, v[:maxCellBytes/2], len(v))
+	case []any:
+		for i, e := range v {
+			v[i] = compactValue(e)
+		}
+		return truncateJSON(v)
+	case map[string]any:
+		return truncateJSON(v)
+	case json.Marshaler:
+		return v
+	case driver.Valuer:
+		if text, err := v.Value(); err == nil {
+			return text
+		}
+	}
+	return v
 }
 
-func (s *Server) runPaginatedQuery(ctx context.Context, sql string, page, pageSize int) (*PaginatedResult, error) {
-	// First, get total count
-	countSQL := fmt.Sprintf("WITH query AS (%s) SELECT COUNT(*) FROM query", sql)
-
-	ctxTO, cancel := context.WithTimeout(ctx, s.cfg.QueryTO)
-	defer cancel()
-
-	conn, err := s.db.Acquire(ctxTO)
-	if err != nil {
-		return nil, err
+// truncateJSON keeps a jsonb or array value whole unless its JSON text is over maxCellBytes.
+func truncateJSON(v any) any {
+	b, err := json.Marshal(v, jsontext.AllowInvalidUTF8(true))
+	if err != nil || len(b) <= maxCellBytes {
+		return v
 	}
-	defer conn.Release()
-
-	tx, err := conn.BeginTx(ctxTO, pgx.TxOptions{AccessMode: pgx.ReadOnly})
-	if err != nil {
-		return nil, err
-	}
-	defer tx.Rollback(ctxTO)
-
-	var totalCount int
-	if err := tx.QueryRow(ctxTO, countSQL).Scan(&totalCount); err != nil {
-		return nil, fmt.Errorf("failed to get total count: %w", err)
-	}
-
-	// Get paginated data
-	offset := page * pageSize
-	paginatedSQL := fmt.Sprintf("WITH query AS (%s) SELECT * FROM query LIMIT %d OFFSET %d", sql, pageSize, offset)
-
-	rows, err := tx.Query(ctxTO, paginatedSQL)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-
-	flds := rows.FieldDescriptions()
-	out := make([]map[string]any, 0, pageSize)
-	for rows.Next() {
-		vals, err := rows.Values()
-		if err != nil {
-			return nil, err
-		}
-		row := make(map[string]any, len(flds))
-		for i, f := range flds {
-			row[string(f.Name)] = vals[i]
-		}
-		out = append(out, row)
-	}
-
-	if err := rows.Err(); err != nil {
-		return nil, err
-	}
-
-	if err := tx.Commit(ctxTO); err != nil {
-		return nil, err
-	}
-
-	hasMore := offset+len(out) < totalCount
-	nextPage := page + 1
-	if !hasMore {
-		nextPage = 0
-	}
-
-	return &PaginatedResult{
-		Rows:       out,
-		Page:       page,
-		PageSize:   pageSize,
-		TotalCount: totalCount,
-		HasMore:    hasMore,
-		NextPage:   nextPage,
-	}, nil
+	return truncateCell(string(b))
 }
 
-func (s *Server) runStreamingQuery(ctx context.Context, sql string, maxPages, pageSize int) ([]streamPageOutput, int, error) {
-	// First, get total count
-	countSQL := fmt.Sprintf("WITH query AS (%s) SELECT COUNT(*) FROM query", sql)
-
-	ctxTO, cancel := context.WithTimeout(ctx, s.cfg.QueryTO*time.Duration(maxPages))
-	defer cancel()
-
-	conn, err := s.db.Acquire(ctxTO)
-	if err != nil {
-		return nil, 0, err
+func truncateCell(s string) string {
+	if len(s) <= maxCellBytes {
+		return s
 	}
-	defer conn.Release()
-
-	tx, err := conn.BeginTx(ctxTO, pgx.TxOptions{AccessMode: pgx.ReadOnly})
-	if err != nil {
-		return nil, 0, err
-	}
-	defer tx.Rollback(ctxTO)
-
-	var totalCount int
-	if err := tx.QueryRow(ctxTO, countSQL).Scan(&totalCount); err != nil {
-		return nil, 0, fmt.Errorf("failed to get total count: %w", err)
-	}
-
-	// Calculate actual pages to fetch
-	totalPages := (totalCount + pageSize - 1) / pageSize
-	pagesToFetch := minNonZero(maxPages, totalPages)
-
-	var pages []streamPageOutput
-
-	// Fetch pages
-	for page := 0; page < pagesToFetch; page++ {
-		offset := page * pageSize
-		paginatedSQL := fmt.Sprintf("WITH query AS (%s) SELECT * FROM query LIMIT %d OFFSET %d", sql, pageSize, offset)
-
-		rows, err := tx.Query(ctxTO, paginatedSQL)
-		if err != nil {
-			return nil, 0, err
-		}
-
-		flds := rows.FieldDescriptions()
-		pageRows := make([]map[string]any, 0, pageSize)
-		for rows.Next() {
-			vals, err := rows.Values()
-			if err != nil {
-				rows.Close()
-				return nil, 0, err
-			}
-			row := make(map[string]any, len(flds))
-			for i, f := range flds {
-				row[string(f.Name)] = vals[i]
-			}
-			pageRows = append(pageRows, row)
-		}
-		rows.Close()
-
-		if err := rows.Err(); err != nil {
-			return nil, 0, err
-		}
-
-		pages = append(pages, streamPageOutput{
-			Page: page,
-			Rows: pageRows,
-		})
-
-		// Stop if no more rows
-		if len(pageRows) < pageSize {
-			break
-		}
-	}
-
-	if err := tx.Commit(ctxTO); err != nil {
-		return nil, 0, err
-	}
-
-	return pages, totalCount, nil
+	// The cut may split a rune; dropping the fragment keeps the text valid UTF-8.
+	return fmt.Sprintf("%s…(%d bytes)", strings.ToValidUTF8(s[:maxCellBytes], ""), len(s))
 }
 
-func (s *Server) buildSearchSQL(ctx context.Context, q string, limit int) (string, error) {
+func (s *Server) buildSearchSQL(ctx context.Context, q string, limit int) (string, []any, error) {
 	const meta = `
 SELECT table_schema, table_name, column_name
 FROM information_schema.columns
@@ -1050,9 +782,11 @@ ORDER BY table_schema, table_name, ordinal_position;
 `
 	ctxTO, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
+	s.dbMu.RLock()
+	defer s.dbMu.RUnlock()
 	rows, err := s.db.Query(ctxTO, meta)
 	if err != nil {
-		return "", err
+		return "", nil, err
 	}
 	defer rows.Close()
 
@@ -1061,134 +795,90 @@ ORDER BY table_schema, table_name, ordinal_position;
 	for rows.Next() {
 		var c col
 		if err := rows.Scan(&c.s, &c.t, &c.c); err != nil {
-			return "", err
+			return "", nil, err
 		}
 		cols = append(cols, c)
 	}
-	if len(cols) == 0 {
-		return "", errors.New("no searchable columns")
+	if err := rows.Err(); err != nil {
+		return "", nil, err
 	}
-	like := strings.ReplaceAll(q, "'", "''")
+	if len(cols) == 0 {
+		return "", nil, errors.New("no searchable columns")
+	}
 	var parts []string
+	args := []any{q}
 	for _, c := range cols {
+		sourceArg := len(args) + 1
+		columnArg := sourceArg + 1
+		args = append(args, c.s+"."+c.t, c.c)
 		parts = append(parts, fmt.Sprintf(
-			`SELECT '%s.%s' AS source_table, '%s' AS column, LEFT(CAST("%s" AS text), 240) AS match_text FROM "%s"."%s" WHERE "%s" ILIKE '%%%s%%'`,
-			c.s, c.t, c.c, c.c, c.s, c.t, c.c, like,
+			`SELECT CAST($%d AS text) AS source_table, CAST($%d AS text) AS "column", LEFT(CAST(%s AS text), 240) AS match_text FROM %s WHERE %s ILIKE '%%' || $1 || '%%'`,
+			sourceArg, columnArg, pgx.Identifier{c.c}.Sanitize(),
+			pgx.Identifier{c.s, c.t}.Sanitize(), pgx.Identifier{c.c}.Sanitize(),
 		))
 		if len(parts) >= 60 {
 			break
 		}
 	}
 	sql := "WITH u AS (\n" + strings.Join(parts, "\nUNION ALL\n") + fmt.Sprintf("\n) SELECT * FROM u LIMIT %d", limit)
-	return sql, nil
+	return sql, args, nil
 }
 
-func (s *Server) generateSQL(ctx context.Context, question, schema string, maxRows int) (string, string, error) {
-	sys := `You translate plain English questions into a SINGLE, safe PostgreSQL query for ANY PostgreSQL database.
+// newMCPServer registers only the tools the configuration enables: every tool
+// definition is sent to the model with each conversation.
+func newMCPServer(srv *Server) *mcp.Server {
+	server := mcp.NewServer(&mcp.Implementation{Name: "postgres-mcp-go", Version: "0.3.0"}, nil)
 
-	Core Rules:
-	- Use only read-only SQL (WITH/SELECT). No writes, DDL, or side effects.
-	- Use proper JOINs based on foreign key relationships shown in the schema.
-	- Always include an explicit LIMIT <= ` + fmt.Sprint(maxRows) + `.
-	- Do not add semicolons.
-	- Return concise, meaningful column aliases.
-	- CRITICAL: Use table and column names EXACTLY as shown in the schema below, including quotes when present.
-
-	Query Scope Rules:
-	- SINGULAR questions ("Who is the...", "What is the...") -> LIMIT 1
-	- PLURAL questions ("Who are the...", "What are the...") -> LIMIT 20
-	- COUNT questions ("How many...") -> Return COUNT, no additional LIMIT
-	- LIST questions ("List all...", "Show all...") -> LIMIT 50
-	- COMPARISON questions ("Compare X and Y...") -> Return just the compared items
-	
-	User Override Rules (when user explicitly wants more results):
-	- "Show ALL [items]" or "List ALL [items]" -> Use larger LIMIT (200-500)
-	- "Give me EVERY [item]" -> Use larger LIMIT (200-500) 
-	- "Show me EVERYTHING" -> Use larger LIMIT (200-500)
-	- "Complete list of [items]" -> Use larger LIMIT (200-500)
-	- When user emphasizes ALL/EVERY/COMPLETE -> Override normal limits
-	- But still respect the maximum LIMIT constraint provided
-
-	CRITICAL COLUMN CHECKING RULES:
-	- BEFORE writing ANY SQL, verify EVERY column exists in the table you're using
-	- ONLY use columns that are explicitly listed in the schema below
-	- If you need a column that doesn't exist in your target table, you MUST use JOINs
-	- Example: If you need user_id but you're querying order_items (which has no user_id), 
-	  you MUST JOIN: order_items -> orders -> users via the foreign keys shown in schema
-	- NEVER assume standard columns like 'id' exist - many tables use composite keys
-	- For counting records: use COUNT(*) instead of COUNT(table.id) unless 'id' is explicitly shown
-	- NEVER write SQL with non-existent columns - this will cause errors
-
-	Universal Data Handling:
-	- Work ONLY with tables and columns shown in the schema summary below
-	- NEVER assume columns exist - only use columns explicitly listed in the schema
-	- NEVER assume specific data values, enum values, or business logic
-	- NEVER filter by assumed status values (completed, active, etc.) unless explicitly mentioned
-	- If user asks for "top X" or "most Y", aggregate and sort the available data as-is
-	- Use column names and relationships exactly as they appear in the schema
-	- When in doubt, include more data rather than filtering it out
-	- Focus on structural relationships (JOINs) rather than data content assumptions
-
-	CRITICAL Identifier Rules (PostgreSQL Case Sensitivity):
-	- PostgreSQL identifiers are case-sensitive when quoted with double quotes
-	- Use table and column names EXACTLY as they appear in the schema below
-	- If the schema shows "Book" (with quotes), you MUST use "Book" in your SQL
-	- If the schema shows book (no quotes), you can use book, Book, or BOOK
-	- NEVER change the case or remove quotes from identifiers shown in the schema
-	- When in doubt, copy the identifier exactly as shown in the schema
-
-	CRITICAL Counting and Aggregation Rules:
-	- For counting records, use COUNT(*) or COUNT(1) instead of COUNT(table.id)
-	- Only use COUNT(column_name) if that column is explicitly listed in the schema
-	- Many tables use composite primary keys and don't have an 'id' column
-	- For aggregating quantities or amounts, use SUM(column_name) where column_name exists
-	- Always verify the column exists in the schema before using it in COUNT, SUM, AVG, etc.
-
-	JOIN Strategy (CRITICAL - Generic approach for ANY database):
-	- ALWAYS check the schema summary for foreign key relationships before writing JOINs
-	- Look for "FK" lines in the schema that show: table1(column1) -> table2(column2)
-	- If a column doesn't exist in the target table, trace the foreign key path in the schema
-	- Example: If table A has column X, but you need column Y from table B, look for FK A.some_id -> B.id
-	- Use ONLY the foreign key relationships explicitly shown in the schema summary
-	- When multiple JOIN paths exist, choose the most direct one with fewest tables
-	
-	Performance Guidelines (CRITICAL):
-	- PREFER single-table queries when possible
-	- When JOINs are necessary, use ONLY the foreign key relationships explicitly shown in schema
-	- Limit JOINs to maximum 2 tables to avoid expensive operations
-	- Use INNER JOINs instead of LEFT JOINs when possible
-	- If a question requires more than 2 JOINs, simplify to a single-table approximation
-	- NEVER assume columns exist in the wrong table - always verify against schema first
-
-	MANDATORY: Study this schema summary carefully before writing SQL. It shows all tables, columns, and foreign key relationships:
-	
-	` + schema + `
-	
-	REMEMBER: If you need a column that doesn't exist in your target table, find the FK relationship above and use JOINs.`
-
-	user := "Question: " + strings.TrimSpace(question) + `
-Return ONLY SQL, nothing else.`
-
-	ctxTO, cancel := context.WithTimeout(ctx, 18*time.Second)
-	defer cancel()
-
-	resp, err := s.llm.Chat.Completions.New(ctxTO, openai.ChatCompletionNewParams{
-		Model: openai.ChatModel(s.model),
-		Messages: []openai.ChatCompletionMessageParamUnion{
-			openai.SystemMessage(sys),
-			openai.UserMessage(user),
-		},
-		MaxTokens:   openai.Int(maxModelTokens),
-		Temperature: openai.Float(0.2),
-	})
-	if err != nil {
-		return "", "", err
+	mcp.AddTool(server, &mcp.Tool{
+		Name:        "query",
+		Description: "Run one read-only SELECT, WITH, EXPLAIN, or SHOW statement. Use $1, $2, and params for values; results are capped by MAX_ROWS.",
+	}, textResult(srv.handleQuery))
+	mcp.AddTool(server, &mcp.Tool{
+		Name:        "list_schemas",
+		Description: "List non-system schemas in the connected PostgreSQL database.",
+	}, textResult(srv.handleListSchemas))
+	mcp.AddTool(server, &mcp.Tool{
+		Name:        "list_tables",
+		Description: "List tables and views in a schema, defaulting to public.",
+	}, textResult(srv.handleListTables))
+	mcp.AddTool(server, &mcp.Tool{
+		Name:        "describe_table",
+		Description: "Describe a table's columns, types, nullability, defaults, and primary keys.",
+	}, textResult(srv.handleDescribeTable))
+	if srv.cfg.AllowWrite {
+		mcp.AddTool(server, &mcp.Tool{
+			Name:        "execute",
+			Description: "Execute one SQL statement that changes data or schema. Use $1, $2, and params for values.",
+		}, textResult(srv.handleExecute))
 	}
-	sql := strings.TrimSpace(resp.Choices[0].Message.Content)
-	sql = strings.Trim(sql, "```")
-	sql = strings.TrimSpace(strings.TrimPrefix(sql, "sql"))
-	note := "model=" + s.model
-	return sql, note, nil
+	if srv.cfg.EnableRuntimeConnect {
+		mcp.AddTool(server, &mcp.Tool{
+			Name:        "connect_db",
+			Description: "Switch the server to a PostgreSQL database using the supplied credentials.",
+		}, textResult(srv.handleConnectDB))
+	}
+	mcp.AddTool(server, &mcp.Tool{
+		Name:        "search",
+		Description: "Search free text across all tables/columns (ILIKE).",
+	}, textResult(srv.handleSearch))
+	return server
+}
+
+// textResult sends a handler's output once, as compact JSON text. With a typed
+// output the SDK would also publish an outputSchema in tools/list and send the
+// same JSON a second time as structuredContent.
+func textResult[In, Out any](h mcp.ToolHandlerFor[In, Out]) mcp.ToolHandlerFor[In, any] {
+	return func(ctx context.Context, req *mcp.CallToolRequest, in In) (*mcp.CallToolResult, any, error) {
+		_, out, err := h(ctx, req, in)
+		if err != nil {
+			return nil, nil, err
+		}
+		text, err := json.Marshal(out, jsontext.AllowInvalidUTF8(true))
+		if err != nil {
+			return nil, nil, err
+		}
+		return &mcp.CallToolResult{Content: []mcp.Content{&mcp.TextContent{Text: string(text)}}}, nil, nil
+	}
 }
 
 func main() {
@@ -1237,22 +927,7 @@ func main() {
 	if err != nil {
 		log.Fatal().Err(err).Msg("init failed")
 	}
-	impl := &mcp.Implementation{Name: "postgres-mcp-go", Version: "0.3.0"}
-
-	server := mcp.NewServer(impl, nil)
-
-	mcp.AddTool(server, &mcp.Tool{
-		Name:        "ask",
-		Description: "Answer questions about the connected PostgreSQL database by generating safe, read-only SQL. Automatically streams all results.",
-	}, srv.handleAsk)
-	mcp.AddTool(server, &mcp.Tool{
-		Name:        "search",
-		Description: "Search free text across all tables/columns (ILIKE).",
-	}, srv.handleSearch)
-	mcp.AddTool(server, &mcp.Tool{
-		Name:        "stream",
-		Description: "Stream large result sets by automatically fetching all pages. Returns complete results progressively.",
-	}, srv.handleStream)
+	server := newMCPServer(srv)
 
 	if isStdio {
 		runStdio(ctx, srv, server)
@@ -1320,7 +995,7 @@ func main() {
 	log.Info().Str("addr", addr).Str("path", path).Msg("starting MCP server on streamable HTTP")
 	auditLog("server_start", "system", "", addr, true)
 
-	if err := httpServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+	if err := httpServer.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 		log.Fatal().Err(err).Msg("server error")
 	}
 }
@@ -1328,7 +1003,11 @@ func main() {
 // runStdio serves MCP over stdin/stdout (mssql-mcp style: {"command": ".../postgres-mcp-server", "env": {...}}).
 // stdout is reserved for the protocol — all logs must go to stderr (configured in main).
 func runStdio(ctx context.Context, srv *Server, server *mcp.Server) {
-	defer srv.db.Close()
+	defer func() {
+		if err := srv.Shutdown(context.Background()); err != nil {
+			log.Error().Err(err).Msg("stdio server shutdown failed")
+		}
+	}()
 
 	ctx, stop := signal.NotifyContext(ctx, syscall.SIGINT, syscall.SIGTERM)
 	defer stop()

@@ -184,7 +184,7 @@ text`},
 	}
 }
 
-func TestAsksFlag(t *testing.T) {
+func TestQueriesFlag(t *testing.T) {
 	tests := []struct {
 		name   string
 		values []string
@@ -209,14 +209,16 @@ func TestAsksFlag(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			var flag asksFlag
+			var flag queriesFlag
 			for _, v := range tt.values {
-				flag.Set(v)
+				if err := flag.Set(v); err != nil {
+					t.Fatalf("queriesFlag.Set(%q): %v", v, err)
+				}
 			}
 
 			got := flag.String()
 			if got != tt.want {
-				t.Fatalf("asksFlag.String() = %q, want %q", got, tt.want)
+				t.Fatalf("queriesFlag.String() = %q, want %q", got, tt.want)
 			}
 		})
 	}
@@ -247,13 +249,21 @@ func TestPrintFormattedResultStructure(t *testing.T) {
 			format: "json",
 		},
 		{
-			name: "streaming_result",
+			name: "query_result",
 			result: map[string]any{
 				"sql":  "SELECT * FROM test",
 				"rows": []any{map[string]any{"id": 1}, map[string]any{"id": 2}},
-				"note": "model=test (streamed 2 pages)",
 			},
 			format: "table",
+		},
+		{
+			name: "columnar_result",
+			result: map[string]any{
+				"columns":   []any{"id", "name"},
+				"rows":      []any{[]any{1.0, "a"}, []any{2.0}},
+				"truncated": true,
+			},
+			format: "csv",
 		},
 	}
 
