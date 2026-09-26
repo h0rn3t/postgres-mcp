@@ -427,6 +427,8 @@ export DATABASE_URL="postgres://user:pass@host:5432/your_db"
 
 ### Інтеграція з Cursor
 
+Варіант HTTP (сервер запущено окремо):
+
 ```bash
 # Запуск сервера
 export DATABASE_URL="postgres://user:pass@localhost:5432/your_db"
@@ -447,9 +449,30 @@ export DATABASE_URL="postgres://user:pass@localhost:5432/your_db"
 }
 ```
 
+Варіант stdio в стилі mssql-mcp (без окремого HTTP-сервера, див. розділ «Конфігурація в стилі mssql-mcp (stdio)»):
+```json
+{
+  "mcpServers": {
+    "postgres": {
+      "command": "/path/to/bin/postgres-mcp-server",
+      "args": ["--transport", "stdio"],
+      "env": {
+        "POSTGRES_HOST": "localhost",
+        "POSTGRES_PORT": "5432",
+        "POSTGRES_DATABASE": "YourDatabase",
+        "POSTGRES_USER": "postgres",
+        "POSTGRES_PASSWORD": "YourPassword",
+        "POSTGRES_SSLMODE": "disable",
+        "OPENAI_API_KEY": "your-api-key"
+      }
+    }
+  }
+}
+```
+
 ### Інтеграція з Claude Desktop
 
-Відредагуйте `~/.config/claude-desktop/claude_desktop_config.json`:
+Варіант HTTP — відредагуйте `~/.config/claude-desktop/claude_desktop_config.json`:
 ```json
 {
   "mcpServers": {
@@ -457,6 +480,22 @@ export DATABASE_URL="postgres://user:pass@localhost:5432/your_db"
       "transport": {
         "type": "http",
         "url": "http://localhost:8080/mcp"
+      }
+    }
+  }
+}
+```
+
+Варіант stdio в стилі mssql-mcp (без окремого HTTP-сервера, див. розділ «Конфігурація в стилі mssql-mcp (stdio)»):
+```json
+{
+  "mcpServers": {
+    "postgres": {
+      "command": "/path/to/bin/postgres-mcp-server",
+      "args": ["--transport", "stdio"],
+      "env": {
+        "DATABASE_URL": "postgres://postgres:YourPassword@localhost:5432/YourDatabase?sslmode=disable",
+        "OPENAI_API_KEY": "your-api-key"
       }
     }
   }
