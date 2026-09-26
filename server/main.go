@@ -22,6 +22,7 @@ import (
 	"uuid"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 	"github.com/rs/zerolog"
@@ -508,17 +509,14 @@ func (s *Server) handleDescribeTable(ctx context.Context, _ *mcp.CallToolRequest
 	defer cancel()
 	rows, err := s.db.Query(ctxTO, `
 SELECT c.column_name, c.data_type, c.is_nullable = 'YES', c.column_default,
+       -- information_schema.table_constraints hides tables the role has only
+       -- SELECT on; pg_constraint does not. ordinal_position is the attnum.
        EXISTS (
            SELECT 1
-           FROM information_schema.key_column_usage k
-           JOIN information_schema.table_constraints t
-             ON t.constraint_catalog = k.constraint_catalog
-            AND t.constraint_schema = k.constraint_schema
-            AND t.constraint_name = k.constraint_name
-           WHERE t.constraint_type = 'PRIMARY KEY'
-             AND k.table_schema = c.table_schema
-             AND k.table_name = c.table_name
-             AND k.column_name = c.column_name
+           FROM pg_constraint k
+           WHERE k.contype = 'p'
+             AND k.conrelid = format('%I.%I', c.table_schema, c.table_name)::regclass
+             AND c.ordinal_position = ANY (k.conkey)
        )
 FROM information_schema.columns c
 WHERE c.table_schema = $1 AND c.table_name = $2
@@ -701,7 +699,8 @@ func (s *Server) runReadOnlyQuery(ctx context.Context, sql string, args []any, l
 	defer rows.Close()
 
 	var out rowsOutput
-	for _, f := range rows.FieldDescriptions() {
+	fields := rows.FieldDescriptions()
+	for _, f := range fields {
 		out.Columns = append(out.Columns, f.Name)
 	}
 	for rows.Next() {
@@ -714,6 +713,18 @@ func (s *Server) runReadOnlyQuery(ctx context.Context, sql string, args []any, l
 			return rowsOutput{}, err
 		}
 		for i, v := range vals {
+			// pgx decodes "char" (relkind, contype, proargmodes) as a rune, the
+			// same int32 as int4, so only the column type tells it apart.
+			switch fields[i].DataTypeOID {
+			case pgtype.QCharOID:
+				v = qcharText(v)
+			case pgtype.QCharArrayOID:
+				if elems, ok := v.([]any); ok {
+					for j, e := range elems {
+						elems[j] = qcharText(e)
+					}
+				}
+			}
 			vals[i] = compactValue(v)
 		}
 		out.Rows = append(out.Rows, vals)
@@ -751,6 +762,14 @@ func compactValue(v any) any {
 		if text, err := v.Value(); err == nil {
 			return text
 		}
+	}
+	return v
+}
+
+// qcharText turns a decoded "char" into its one-character text; NULL stays nil.
+func qcharText(v any) any {
+	if r, ok := v.(rune); ok {
+		return string(r)
 	}
 	return v
 }

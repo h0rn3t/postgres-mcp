@@ -3,6 +3,7 @@ package main
 import (
 	"encoding/json/v2"
 	"math/big"
+	"net/url"
 	"os"
 	"slices"
 	"strings"
@@ -144,6 +145,56 @@ func TestToolResults(t *testing.T) {
 			}
 			if tt.wantTruncated && len(got.Rows) != tt.wantRows {
 				t.Errorf("CallTool(%s, %v) = %d rows, want %d", tt.tool, tt.args, len(got.Rows), tt.wantRows)
+			}
+		})
+	}
+}
+
+// The server usually runs as a role with SELECT only, which information_schema
+// hides constraints from.
+func TestReaderResults(t *testing.T) {
+	db := mustPool(t)
+	defer db.Close()
+	resetSchema(t, db)
+	if _, err := db.Exec(t.Context(), `
+CREATE TABLE alembic_version (version_num varchar(32) NOT NULL, note text, CONSTRAINT alembic_version_pkc PRIMARY KEY (version_num));
+DROP ROLE IF EXISTS postgres_mcp_reader;
+CREATE ROLE postgres_mcp_reader LOGIN PASSWORD 'reader';
+GRANT USAGE ON SCHEMA public TO postgres_mcp_reader;
+GRANT SELECT ON ALL TABLES IN SCHEMA public TO postgres_mcp_reader;`); err != nil {
+		t.Fatalf("create reader role: %v", err)
+	}
+	dsn, err := url.Parse(db.Config().ConnString())
+	if err != nil {
+		t.Fatalf("url.Parse(DATABASE_URL) error = %v", err)
+	}
+	dsn.User = url.UserPassword("postgres_mcp_reader", "reader")
+	srv, err := newServer(t.Context(), Config{DatabaseURL: dsn.String(), QueryTO: 5 * time.Second, MaxRows: 3})
+	if err != nil {
+		t.Fatalf("newServer() error = %v", err)
+	}
+	defer func() { _ = srv.Shutdown(t.Context()) }()
+	session := connectInMemory(t, srv)
+
+	tests := []struct {
+		name string
+		tool string
+		args map[string]any
+		want string
+	}{
+		{"primary key", "describe_table", map[string]any{"table": "alembic_version"},
+			`{"schema":"public","table":"alembic_version","columns":[{"name":"version_num","data_type":"character varying","nullable":false,"primary_key":true},{"name":"note","data_type":"text","nullable":true,"primary_key":false}]}`},
+		{"char as text", "query", map[string]any{"sql": `SELECT c.contype, r.relkind, NULL::"char" AS none, '{i,o,NULL}'::"char"[] AS modes, 112 AS n FROM pg_constraint c JOIN pg_class r ON r.oid = c.conrelid WHERE c.conname = 'alembic_version_pkc'`},
+			`{"columns":["contype","relkind","none","modes","n"],"rows":[["p","r",null,["i","o",null],112]]}`},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			res, err := session.CallTool(t.Context(), &mcp.CallToolParams{Name: tt.tool, Arguments: tt.args})
+			if err != nil {
+				t.Fatalf("CallTool(%s, %v) error = %v", tt.tool, tt.args, err)
+			}
+			if got := res.Content[0].(*mcp.TextContent).Text; got != tt.want {
+				t.Errorf("CallTool(%s, %v) = %s, want %s", tt.tool, tt.args, got, tt.want)
 			}
 		})
 	}
